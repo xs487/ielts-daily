@@ -4,7 +4,7 @@ const practiceBase = `Create original IELTS Academic practice at approximately B
 
 const listeningScriptPrompt = `${practiceBase} Create exactly one complete IELTS Listening script with this shape: {"title":"","scenario":"","script":""}. Write a natural dialogue or monologue of 750-950 words, at most 8000 characters, appropriate to the specified part. Develop the topic fully with concrete details, corrections, comparisons and plausible distractors for a separate set of ten questions. Do not include questions or answers in the output. Before returning, count the words and expand any draft shorter than 750 words.`;
 
-const listeningQuestionsPrompt = `${practiceBase} Create exactly 10 IELTS Listening questions for the supplied script with this shape: {"questions":[{"number":1,"format":"text|choice","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Use the supplied sequential number range. Use form/note completion, multiple choice and short answer. Do not use TRUE/FALSE/NOT GIVEN or YES/NO/NOT GIVEN; these are Reading formats. For choice use 3 options and make answer exactly match the correct option. Every question needs an unambiguous answer and concise explanation. State a clear word limit for text-answer questions. Base answers on the script and order questions to follow it. Return questions only; do not repeat the script.`;
+const listeningQuestionsPrompt = `${practiceBase} Create exactly 10 IELTS Listening questions for the supplied script with this shape: {"questions":[{"number":1,"format":"text|choice","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Use the supplied sequential number range. Use form/note completion, multiple choice and short answer. Do not use TRUE/FALSE/NOT GIVEN or YES/NO/NOT GIVEN; these are Reading formats. For choice use 3 options and make answer exactly match the correct option. Every question needs an unambiguous answer and concise explanation. For every text question, use a concise answer of at most THREE words, state the appropriate word limit in its prompt, and verify answer and every acceptedAnswers variant fit that exact limit. For example, 'car park' requires TWO words, never ONE WORD ONLY. Do not include unnecessary prepositions in an answer. Base answers on the script and order questions to follow it. Return questions only; do not repeat the script.`;
 
 const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""}}. Passage text must contain 650-900 words. Use the supplied passage ID. Develop a coherent academic argument or explanation with enough specific evidence for a separate reading question set. Return the passage only.`;
 
@@ -189,6 +189,27 @@ function validQuestions(questions, firstNumber) { return validQuestionSet(questi
 
 function wordCount(value) { return (String(value||'').match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g)||[]).length; }
 
+function answerLengthIssues(questions) {
+  const issues=[];
+  for(const question of questions||[]){
+    if(question.format!=='text')continue;
+    const match=question.prompt.match(/\b(one|two|three|[1-3])\s+words?\b/i);
+    const limit=match?({one:1,two:2,three:3}[match[1].toLowerCase()]||Number(match[1])):3;
+    const allowsNumber=/\b(?:and\/or|and|or)\s+(?:a|one|1)\s+number\b/i.test(question.prompt);
+    const answers=[question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])];
+    for(const answer of answers){
+      if(typeof answer!=='string'||!answer.trim())continue;
+      const words=answer.trim().split(/\s+/);
+      const numbers=allowsNumber?words.filter(word=>/^\d+(?:[.,:]\d+)*$/.test(word)).length:0;
+      if(words.length-numbers>limit||numbers>1){
+        issues.push(`answer_exceeds_word_limit:q${question.number}:${words.length-numbers}_words;maximum_${limit}`);
+        break;
+      }
+    }
+  }
+  return issues;
+}
+
 function validReading(reading) {
   if(!Array.isArray(reading?.passages)||reading.passages.length!==3||!Array.isArray(reading.questions)||reading.questions.length!==40)return false;
   if(reading.passages.some(passage=>!passage||typeof passage.id!=='string'||typeof passage.title!=='string'||typeof passage.text!=='string'))return false;
@@ -214,6 +235,7 @@ function moduleIssues(module, value) {
     const issues=[];
     if(!validQuestions(value?.questions,module.firstNumber))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
     else if(value.questions.some(question=>question.format==='tfng'))issues.push('listening_format_must_be_text_or_choice');
+    else issues.push(...answerLengthIssues(value.questions));
     return issues;
   }
   if(module.kind==='reading'){
@@ -226,6 +248,7 @@ function moduleIssues(module, value) {
     const issues=[];
     if(!validQuestionSet(value?.questions,module.firstNumber,module.count))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
     else if(value.questions.some(question=>question.passageId!==module.passageId||typeof question.evidence!=='string'||!question.evidence.trim()))issues.push('question_link_or_evidence');
+    else issues.push(...answerLengthIssues(value.questions));
     return issues;
   }
   const writing=value?.writing;
