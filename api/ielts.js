@@ -310,7 +310,7 @@ async function collectDoubaoAudio(response) {
     if(!frame||typeof frame!=='object'||Array.isArray(frame))throw ttsFailure('TTS_INVALID_RESPONSE','invalid_frame');
     if(frame.code===20000000){finished=true;return;}
     if(frame.code!==0)throw ttsFailure('TTS_UPSTREAM_ERROR','upstream_error_frame');
-    if(frame.data===undefined||frame.data==='')return;
+    if(frame.data===undefined||frame.data===null||frame.data==='')return;
     if(typeof frame.data!=='string'){
       const shape=Array.isArray(frame.data)?`array_${frame.data.length}`:frame.data===null?'null':typeof frame.data==='object'?`object_${Object.keys(frame.data).length}`:typeof frame.data;
       throw ttsFailure('TTS_INVALID_RESPONSE',`invalid_audio_data_type_${shape}`);
