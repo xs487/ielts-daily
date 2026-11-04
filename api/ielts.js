@@ -1,19 +1,12 @@
 const {createHash,randomUUID} = require('node:crypto');
 
-const systemPrompt = `You are an IELTS Academic practice-material author. Create original practice, never claim it is an official IELTS paper, and never copy remembered test material. Use the supplied vocabulary naturally across the paper; do not force every word into every passage. Keep language and task structures faithful to IELTS Academic.
+const practiceBase = `Create original IELTS Academic practice at approximately Band 7 level. Never claim it is an official IELTS paper or copy remembered test material. Use supplied vocabulary naturally where it fits. Return valid JSON only. Keep answers and explanations out of learner-facing prompts.`;
 
-For action=generate, return one JSON object with exactly this shape:
-{"listening":{"parts":[{"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}]},"reading":{"passages":[{"id":"P1","title":"","text":""}],"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]},"writing":{"task1":{"prompt":"","chart":{"title":"","categories":[],"series":[{"name":"","values":[]}] }},"task2":{"prompt":""}},"speaking":{"part1":[],"part2":{"cueCard":""},"part3":[]}}.
+const listeningPartPrompt = `${practiceBase} Create exactly one Listening part with this shape: {"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Write a complete natural dialogue or monologue appropriate to the specified part. Create exactly 10 questions using the supplied number range. Vary form/note completion, multiple choice, short answer and directions when appropriate. For choice/tfng use 3 options; for choice, answer must exactly match the correct option. Every question needs an unambiguous answer and concise explanation. Before returning, verify the part has exactly 10 sequential numbers and every question is answerable from the script.`;
 
-Listening must have 4 parts and exactly 10 numbered questions per part (1-40). Write a complete natural dialogue/monologue script for each part. Mix note/form completion, multiple choice, short answer, and map/plan directions expressed clearly in question prompts. Use format=text for short answers, choice for options, tfng only when appropriate. For choice/tfng, options must be an array of strings. For choice answers, copy the exact correct option text into answer, not a letter. Answers and concise explanations must be unambiguous.
+const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage and its assigned questions. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""},"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]}. Passage text must contain 650-900 words. Create exactly the requested question count and number range, all linked to the supplied passage ID. Use a mix of TRUE/FALSE/NOT GIVEN, multiple choice and short/sentence completion. For choice/tfng include 3 options and make answer exactly one option; provide acceptable variants for text answers. Every item must be answerable from the passage and include a short evidence quote.`;
 
-Reading must have 3 original passages totalling about 2,150-2,500 words and exactly 40 numbered questions (1-40) linked to a passage. Vary IELTS Academic formats: TRUE/FALSE/NOT GIVEN, multiple choice, short answer, and sentence completion. Use format=tfng with options ["TRUE","FALSE","NOT GIVEN"], format=choice with 3-4 options, and format=text for short answers. Put acceptable short-answer variants in acceptedAnswers. Add a brief evidence quote for every question.
-
-Writing must contain an Academic Task 1 visual-data prompt with coherent categories and numeric series, plus a Task 2 discussion/argument prompt. Both must be original and answerable.
-
-Speaking must include 4-5 Part 1 interview questions, one IELTS-style Part 2 cue card with 3-4 bullets and a final explain question, and 4-5 increasingly analytical Part 3 questions related to Part 2.
-
-Before returning, verify every required part and exact question number/count, passage linkage, readable text length, chart series, and speaking prompt. If a requirement is missing, correct the JSON before returning. Return valid JSON only. Do not put answers or listening scripts in learner-facing prompts; scripts and answers belong only in their specified fields. Do not fabricate official band conversions.`;
+const writingSpeakingPrompt = `${practiceBase} Create original IELTS Academic Writing Task 1 and Task 2 prompts plus Speaking Parts 1-3. Output exactly this shape: {"writing":{"task1":{"prompt":"","chart":{"title":"","categories":["","","",""],"series":[{"name":"","values":[1,2,3,4]},{"name":"","values":[4,3,2,1]}]}},"task2":{"prompt":""}},"speaking":{"part1":[""],"part2":{"cueCard":""},"part3":[""]}}. Task 1 must describe a coherent visual with at least four categories and at least two numeric series, and its prompt must match the data. Task 2 must be an answerable discussion or argument prompt. Speaking Part 1 and Part 3 need 4-5 questions each; Part 2 needs a cue card with 3-4 bullets and a final explain question. Part 3 should extend the Part 2 topic into broader analysis.`;
 
 const gradePrompt = `Evaluate the supplied IELTS Academic writing response as cautious practice feedback, not an official score. Return JSON only with this shape: {"taskResponse":number,"coherenceCohesion":number,"lexicalResource":number,"grammarAccuracy":number,"overallEstimate":number,"strengths":[string],"priorities":[string],"sentenceCorrections":[{"original":string,"revision":string,"reason":string}],"feedback":string}. Scores must be half bands from 0 to 9. Cite evidence from the response. For Task 1, assess task achievement; for Task 2, assess task response. State when the response is too short to assess reliably. Write strengths, priorities, correction reasons, and feedback in simplified Chinese; keep quoted original sentences, revised sentences, and the exam prompt in English.`;
 
@@ -179,14 +172,16 @@ function validWords(words) {
   );
 }
 
-function validQuestions(questions, firstNumber) {
-  return Array.isArray(questions) && questions.length === 10 && questions.every((question,index) =>
+function validQuestionSet(questions, firstNumber, count) {
+  return Array.isArray(questions) && questions.length === count && questions.every((question,index) =>
     question && question.number === firstNumber + index && typeof question.prompt === 'string' && question.prompt.trim() &&
     typeof question.answer === 'string' && question.answer.trim() && typeof question.explanation === 'string' &&
     ['text','choice','tfng'].includes(question.format) &&
     (question.format === 'text' || Array.isArray(question.options) && question.options.length >= 3 && question.options.includes(question.answer))
   );
 }
+
+function validQuestions(questions, firstNumber) { return validQuestionSet(questions,firstNumber,10); }
 
 function wordCount(value) { return (String(value||'').match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g)||[]).length; }
 
@@ -196,9 +191,33 @@ function validReading(reading) {
   const passageIds=reading.passages.map(passage=>passage.id);
   const totalWords=reading.passages.reduce((sum,passage)=>sum+wordCount(passage.text),0);
   if(new Set(passageIds).size!==3||reading.passages.some(passage=>!passage.title||!passage.text)||totalWords<1900||totalWords>2800)return false;
-  return reading.questions.every((question,index)=>question&&question.number===index+1&&question.prompt&&question.answer&&question.explanation&&
+  return reading.questions.every((question,index)=>question&&question.number===index+1&&typeof question.prompt==='string'&&question.prompt.trim()&&typeof question.answer==='string'&&question.answer.trim()&&typeof question.explanation==='string'&&question.explanation.trim()&&typeof question.evidence==='string'&&question.evidence.trim()&&
     ['text','choice','tfng'].includes(question.format)&&passageIds.includes(question.passageId)&&
     (question.format==='text'||Array.isArray(question.options)&&question.options.length>=3&&question.options.includes(question.answer)));
+}
+
+function moduleIssues(module, value) {
+  if(module.kind==='listening'){
+    const issues=[];
+    if(typeof value?.title!=='string'||!value.title.trim()||typeof value?.scenario!=='string'||!value.scenario.trim()||typeof value?.script!=='string'||wordCount(value.script)<120)issues.push('part_content');
+    if(!validQuestions(value?.questions,module.firstNumber))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
+    return issues;
+  }
+  if(module.kind==='reading'){
+    const issues=[];
+    const passage=value?.passage;
+    if(!passage||passage.id!==module.passageId||typeof passage.title!=='string'||!passage.title.trim()||typeof passage.text!=='string'||wordCount(passage.text)<650||wordCount(passage.text)>900)issues.push(`passage_content_or_length:${passage?wordCount(passage.text):0}`);
+    if(!validQuestionSet(value?.questions,module.firstNumber,module.count)||value.questions.some(question=>question.passageId!==module.passageId||typeof question.evidence!=='string'||!question.evidence.trim()))issues.push(`question_count_or_evidence:${Array.isArray(value?.questions)?value.questions.length:0}`);
+    return issues;
+  }
+  const writing=value?.writing;
+  const speaking=value?.speaking;
+  const task1=writing?.task1;
+  const chart=task1?.chart;
+  const issues=[];
+  if(typeof task1?.prompt!=='string'||!task1.prompt.trim()||typeof writing?.task2?.prompt!=='string'||!writing.task2.prompt.trim()||!Array.isArray(chart?.categories)||chart.categories.length<4||chart.categories.some(category=>typeof category!=='string'||!category.trim())||!Array.isArray(chart?.series)||chart.series.length<2||chart.series.some(series=>!series||typeof series.name!=='string'||!series.name.trim()||!Array.isArray(series.values)||series.values.length!==chart.categories.length||series.values.some(value=>typeof value!=='number'||!Number.isFinite(value))))issues.push('writing_tasks_or_chart');
+  if(!Array.isArray(speaking?.part1)||speaking.part1.length<4||speaking.part1.length>5||speaking.part1.some(question=>typeof question!=='string'||!question.trim())||typeof speaking?.part2?.cueCard!=='string'||!speaking.part2.cueCard.trim()||!Array.isArray(speaking?.part3)||speaking.part3.length<4||speaking.part3.length>5||speaking.part3.some(question=>typeof question!=='string'||!question.trim()))issues.push('speaking_parts');
+  return issues;
 }
 
 function paperStructureIssues(paper) {
@@ -490,40 +509,67 @@ module.exports = async function handler(req, res) {
       targetBand: 7,
       vocabulary: body.words.map(item => ({word: item.word.trim(), meaning: String(item.meaning || '').slice(0, 240)}))
     };
-    let result = await openAI(req, res, {
-      system: systemPrompt,
-      user: `Create one complete IELTS Academic daily practice set for this date using this vocabulary data.\n${JSON.stringify(input)}`,
-      maxOutputTokens:32000,
-      timeoutMs:180000
-    },config,true);
-    if(result?.handled){
+    const modules=[];
+    for(let index=0;index<4;index++){
+      const part=index+1,firstNumber=index*10+1;
+      const partInstruction=part===1?'Part 1 is a two-person everyday conversation with form or note completion.':part===2?'Part 2 is one speaker describing a social situation, often with a map or process.':part===3?'Part 3 is an academic discussion between students and/or a tutor.':'Part 4 is a single-speaker academic lecture with note completion.';
+      modules.push({name:`listening_part_${part}`,kind:'listening',part,firstNumber,maxOutputTokens:7000,system:`${listeningPartPrompt} ${partInstruction}`,user:JSON.stringify({module:{kind:'listening',part,firstNumber,count:10},...input})});
+    }
+    const readingCounts=[13,13,14];
+    let firstReadingQuestion=1;
+    for(let index=0;index<3;index++){
+      const passageId=`P${index+1}`,count=readingCounts[index],firstNumber=firstReadingQuestion;
+      firstReadingQuestion+=count;
+      const passageInstruction=index===0?'Use a concrete science, environment, or design topic.':index===1?'Use a distinct topic in history, society, or education.':'Use a distinct topic in policy, technology, or research.';
+      modules.push({name:`reading_${passageId}`,kind:'reading',passageId,firstNumber,count,maxOutputTokens:8500,system:`${readingPassagePrompt} ${passageInstruction}`,user:JSON.stringify({module:{kind:'reading',passageId,firstNumber,count},...input})});
+    }
+    modules.push({name:'writing_speaking',kind:'writing-speaking',maxOutputTokens:6500,system:writingSpeakingPrompt,user:JSON.stringify({module:{kind:'writing-speaking'},...input})});
+
+    async function generateModule(module) {
+      const run=async(issues,retry=false)=>openAI(req,res,{
+        system:issues.length?`${module.system} A previous response for this module failed these checks: ${issues.join(', ')}. Regenerate this module and satisfy them exactly.`:module.system,
+        user:module.user,
+        maxOutputTokens:module.maxOutputTokens,
+        timeoutMs:retry?90000:150000
+      },config,true);
+      try{
+        let generated=await run([]);
+        if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+        let issues=moduleIssues(module,generated);
+        if(issues.length){
+          console.warn('Generated IELTS module failed structure checks',JSON.stringify({module:module.name,issues}));
+          generated=await run(issues,true);
+          if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+          issues=moduleIssues(module,generated);
+        }
+        return issues.length?{module:module.name,issues}:{value:generated};
+      }catch{
+        return {failure:{status:502,body:{error:'AI 练习模块生成失败，请稍后重试。',code:'AI_MODULE_GENERATION_FAILED'}}};
+      }
+    }
+
+    const generatedModules=await Promise.all(modules.map(generateModule));
+    const failedModule=generatedModules.find(item=>item.failure);
+    const invalidModule=generatedModules.find(item=>item.issues);
+    if(failedModule||invalidModule){
+      if(invalidModule)console.warn('IELTS module retry failed structure checks',JSON.stringify({module:invalidModule.module,issues:invalidModule.issues}));
       const released=await generationReservation(req,'release',reservation);
       if(released!==true)return reply(res,503,{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
-      if(result.failure)return reply(res,result.failure.status,result.failure.body);
-      return;
+      if(failedModule)return reply(res,failedModule.failure.status,failedModule.failure.body);
+      return reply(res,502,{error:'部分题目模块经过修复后仍不完整，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'});
     }
-    let issues=paperStructureIssues(result);
+    const values=generatedModules.map(item=>item.value);
+    const result={
+      listening:{parts:values.slice(0,4)},
+      reading:{passages:values.slice(4,7).map(item=>item.passage),questions:values.slice(4,7).flatMap(item=>item.questions)},
+      ...values[7]
+    };
+    const issues=paperStructureIssues(result);
     if(issues.length){
-      console.warn('Generated IELTS paper failed structure checks',JSON.stringify(issues));
-      result=await openAI(req,res,{
-        system:`${systemPrompt}\nA previous draft failed these structural checks: ${issues.join(', ')}. Regenerate the entire paper from scratch and satisfy every listed check exactly. Before returning JSON, verify all required array lengths, numbering, passage word count, passage references, chart data, and speaking parts.`,
-        user:`Create a complete IELTS Academic daily practice set for this date. Use the supplied vocabulary naturally.\n${JSON.stringify(input)}`,
-        maxOutputTokens:32000,
-        timeoutMs:90000
-      },config,true);
-      if(result?.handled){
-        const released=await generationReservation(req,'release',reservation);
-        if(released!==true)return reply(res,503,{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
-        if(result.failure)return reply(res,result.failure.status,result.failure.body);
-        return;
-      }
-      issues=paperStructureIssues(result);
-      if(issues.length){
-        console.warn('Generated IELTS paper retry failed structure checks',JSON.stringify(issues));
-        const released=await generationReservation(req,'release',reservation);
-        if(released!==true)return reply(res,503,{error:'生成结果仍不完整，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
-        return reply(res,502,{error:'生成结果仍未达到完整试卷结构，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'});
-      }
+      console.warn('Combined IELTS modules failed final checks',JSON.stringify(issues));
+      const released=await generationReservation(req,'release',reservation);
+      if(released!==true)return reply(res,503,{error:'生成结果未通过最终检查，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
+      return reply(res,502,{error:'生成结果未通过最终完整性检查，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'});
     }
     const committed=await generationReservation(req,'commit',reservation);
     if(committed!==true)return reply(res,503,{error:'试卷已生成，但暂时无法确认保存今日名额，请稍后刷新状态。',code:'GENERATION_QUOTA_COMMIT_FAILED'});
