@@ -1,4 +1,4 @@
-const {createHash} = require('node:crypto');
+const {createHash,randomUUID} = require('node:crypto');
 
 const systemPrompt = `You are an IELTS Academic practice-material author. Create original practice, never claim it is an official IELTS paper, and never copy remembered test material. Use the supplied vocabulary naturally across the paper; do not force every word into every passage. Keep language and task structures faithful to IELTS Academic.
 
@@ -15,7 +15,13 @@ Speaking must include 4-5 Part 1 interview questions, one IELTS-style Part 2 cue
 
 Return valid JSON only. Do not put answers or listening scripts in learner-facing prompts; scripts and answers belong only in their specified fields. Do not fabricate official band conversions.`;
 
-const gradePrompt = `Evaluate the supplied IELTS Academic writing response as cautious practice feedback, not an official score. Return JSON only with this shape: {"taskResponse":number,"coherenceCohesion":number,"lexicalResource":number,"grammarAccuracy":number,"overallEstimate":number,"strengths":[string],"priorities":[string],"sentenceCorrections":[{"original":string,"revision":string,"reason":string}],"feedback":string}. Scores must be half bands from 0 to 9. Cite evidence from the response. For Task 1, assess task achievement; for Task 2, assess task response. State when the response is too short to assess reliably.`;
+const gradePrompt = `Evaluate the supplied IELTS Academic writing response as cautious practice feedback, not an official score. Return JSON only with this shape: {"taskResponse":number,"coherenceCohesion":number,"lexicalResource":number,"grammarAccuracy":number,"overallEstimate":number,"strengths":[string],"priorities":[string],"sentenceCorrections":[{"original":string,"revision":string,"reason":string}],"feedback":string}. Scores must be half bands from 0 to 9. Cite evidence from the response. For Task 1, assess task achievement; for Task 2, assess task response. State when the response is too short to assess reliably. Write strengths, priorities, correction reasons, and feedback in simplified Chinese; keep quoted original sentences, revised sentences, and the exam prompt in English.`;
+
+const providerProfiles = Object.freeze({
+  openai: Object.freeze({endpoint:'https://api.openai.com/v1/chat/completions',api:'chat',defaultModel:'gpt-4o-mini',modelEnv:'OPENAI_MODEL'}),
+  wawazz: Object.freeze({endpoint:'https://wawazz.xyz/v1/responses',api:'responses',defaultModel:'gpt-5.6-terra',modelEnv:'WAWAZZ_MODEL'}),
+  deepseek: Object.freeze({endpoint:'https://api.deepseek.com/chat/completions',api:'chat',defaultModel:'deepseek-flash',modelEnv:'DEEPSEEK_MODEL',keyEnv:'DEEPSEEK_API_KEY',models:Object.freeze(['deepseek-flash','deepseek-v4-pro'])})
+});
 
 function reply(res, status, body) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -23,18 +29,66 @@ function reply(res, status, body) {
   res.status(status).json(body);
 }
 
-function getOpenAIKey(res) {
-  let key=String(process.env.OPENAI_API_KEY||'').trim();
-  if(!key){
-    reply(res,503,{error:'服务端还没有配置 OpenAI API 密钥。'});
+function normalizeSecret(value) {
+  let key=String(value||'').trim();
+  if((key.startsWith('"')&&key.endsWith('"'))||(key.startsWith("'")&&key.endsWith("'")))key=key.slice(1,-1).trim();
+  return key&&!/[\s"']/.test(key)?key:null;
+}
+
+function getOpenAIKey(res, keyEnv='OPENAI_API_KEY') {
+  const raw=String(process.env[keyEnv]||'').trim();
+  if(!raw){
+    reply(res,503,{error:'服务端还没有配置 AI API 密钥。',code:'AI_KEY_MISSING'});
     return null;
   }
-  if((key.startsWith('"')&&key.endsWith('"'))||(key.startsWith("'")&&key.endsWith("'")))key=key.slice(1,-1).trim();
-  if(!key||/[\s"']/.test(key)){
+  const key=normalizeSecret(raw);
+  if(!key){
     reply(res,503,{error:'服务端密钥格式无效，请管理员重新填写完整密钥。',code:'AI_KEY_FORMAT_INVALID'});
     return null;
   }
   return key;
+}
+
+function getAIConfig(res) {
+  const provider=String(process.env.AI_PROVIDER||'openai').trim().toLowerCase();
+  if(!Object.prototype.hasOwnProperty.call(providerProfiles,provider)){
+    reply(res,503,{error:'AI 服务商配置无效，请网站管理员核对。',code:'AI_PROVIDER_INVALID'});
+    return null;
+  }
+  const profile=providerProfiles[provider];
+  const apiKey=getOpenAIKey(res,profile.keyEnv);
+  if(!apiKey)return null;
+  const model=String(process.env[profile.modelEnv]||profile.defaultModel).trim();
+  if(profile.models&&!profile.models.includes(model)){
+    reply(res,503,{error:'AI 模型配置无效，请网站管理员选择该服务商支持的模型。',code:'AI_MODEL_INVALID'});
+    return null;
+  }
+  return {provider,profile,apiKey,model};
+}
+
+function getTTSConfig() {
+  const aiProvider=String(process.env.AI_PROVIDER||'openai').trim().toLowerCase();
+  const provider=String(process.env.TTS_PROVIDER||(aiProvider==='openai'?'openai':'none')).trim().toLowerCase();
+  if(provider==='doubao'){
+    const apiKey=normalizeSecret(process.env.DOUBAO_TTS_API_KEY);
+    const voice=String(process.env.DOUBAO_TTS_VOICE||'ICL_uranus_en_male_alastor_tob').trim();
+    if(!apiKey||!/^[A-Za-z0-9_-]{1,150}$/.test(voice))return null;
+    return {provider,providerName:'豆包语音',apiKey,voice};
+  }
+  if(provider==='openai'){
+    // A WAWA text key must never be reused for the official OpenAI speech service.
+    const apiKey=normalizeSecret(process.env.OPENAI_TTS_API_KEY||(aiProvider==='openai'?process.env.OPENAI_API_KEY:''));
+    if(!apiKey)return null;
+    return {provider,providerName:'OpenAI',apiKey,model:process.env.OPENAI_TTS_MODEL||'gpt-4o-mini-tts'};
+  }
+  return null;
+}
+
+function publicCapabilities() {
+  const provider=String(process.env.AI_PROVIDER||'openai').trim().toLowerCase();
+  const providerName={wawazz:'WAWA ZZ',deepseek:'DeepSeek',openai:'OpenAI'}[provider]||'AI';
+  const tts=getTTSConfig();
+  return {providerName,audioAvailable:Boolean(tts),audioProviderName:tts?.providerName||null};
 }
 
 async function rateLimit(req, action) {
@@ -51,7 +105,7 @@ async function rateLimit(req, action) {
   const key=`ielts:${action}:${hash}:${window}`;
   try{
     const response=await fetch(`${redisUrl.replace(/\/$/,'')}/pipeline`,{
-      method:'POST',headers:{Authorization:`Bearer ${redisToken}`,'Content-Type':'application/json'},
+      method:'POST',redirect:'error',headers:{Authorization:`Bearer ${redisToken}`,'Content-Type':'application/json'},
       body:JSON.stringify([['INCR',key],['EXPIRE',key,daily?86400:3600]]),signal:AbortSignal.timeout(5000)
     });
     if(!response.ok)return null;
@@ -102,47 +156,234 @@ function replyAIError(res, status, payload) {
   return reply(res,502,{error:'AI 服务暂未完成请求，请稍后重试；如持续失败，请网站管理员核对模型配置。',code:'AI_UPSTREAM_ERROR'});
 }
 
-async function openAI(req, res, body) {
-  const apiKey=getOpenAIKey(res);
-  if(!apiKey)return {handled:true};
-  let response;
-  try { response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      messages: [{role: 'system', content: body.system}, {role: 'user', content: body.user}],
-      response_format: {type: 'json_object'},
-      max_tokens: body.maxTokens || 15000,
-      temperature: body.temperature ?? 0.55
-    }),
-    signal: AbortSignal.timeout(body.timeoutMs || 270000)
-  }); } catch {
-    reply(res, 502, {error: '暂时无法连接 AI 服务，请稍后重试。'});
-    return {handled: true};
+function responseFailure(code) {
+  const messages={
+    AI_INCOMPLETE_RESPONSE:'AI 没有完成整份内容，请稍后重试。',
+    AI_REFUSAL:'AI 暂未提供这份练习内容，请调整训练词后重试。',
+    AI_EMPTY_RESPONSE:'AI 没有返回可用内容，请稍后重试。',
+    AI_INVALID_RESPONSE:'AI 返回格式暂时无法读取，请重试。',
+    AI_UPSTREAM_ERROR:'AI 服务暂未完成请求，请稍后重试。'
+  };
+  return {code,error:messages[code]||messages.AI_UPSTREAM_ERROR};
+}
+
+function parseResponsesStream(text) {
+  let completed;
+  let deltas='';
+  let refusal=false;
+  let terminalStatus;
+  for(const line of text.split(/\r?\n/)){
+    if(!line.startsWith('data:'))continue;
+    const data=line.slice(5).trim();
+    if(!data||data==='[DONE]')continue;
+    let event;
+    try{event=JSON.parse(data);}catch{throw responseFailure('AI_INVALID_RESPONSE');}
+    if(event.type==='response.output_text.delta'&&typeof event.delta==='string')deltas+=event.delta;
+    if(event.type==='response.refusal.delta'||event.type==='response.refusal.done')refusal=true;
+    if(event.type==='response.completed')completed=event.response;
+    if(event.type==='response.incomplete')terminalStatus='incomplete';
+    if(event.type==='response.failed'||event.type==='error')terminalStatus='failed';
   }
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    replyAIError(res,response.status,payload);
-    return {handled: true};
+  if(refusal)throw responseFailure('AI_REFUSAL');
+  if(terminalStatus)throw responseFailure(terminalStatus==='incomplete'?'AI_INCOMPLETE_RESPONSE':'AI_UPSTREAM_ERROR');
+  if(!completed)throw responseFailure('AI_INCOMPLETE_RESPONSE');
+  if((!Array.isArray(completed.output)||completed.output.length===0)&&deltas){
+    completed={...completed,output:[{type:'message',content:[{type:'output_text',text:deltas}]}]};
   }
-  const content = payload.choices?.[0]?.message?.content;
-  if (!content) {
-    reply(res, 502, {error: 'AI 没有返回可用内容，请稍后重试。'});
-    return {handled: true};
+  return completed;
+}
+
+function extractResponsesText(payload) {
+  if(payload?.status==='incomplete')throw responseFailure('AI_INCOMPLETE_RESPONSE');
+  if(payload?.status&&payload.status!=='completed')throw responseFailure('AI_UPSTREAM_ERROR');
+  if(payload?.error)throw responseFailure('AI_UPSTREAM_ERROR');
+  if(!Array.isArray(payload?.output))throw responseFailure('AI_EMPTY_RESPONSE');
+  const texts=[];
+  for(const item of payload.output){
+    if(item?.type==='refusal')throw responseFailure('AI_REFUSAL');
+    if(item?.type!=='message')continue;
+    if(item.status==='incomplete')throw responseFailure('AI_INCOMPLETE_RESPONSE');
+    if(item.status&&item.status!=='completed')throw responseFailure('AI_UPSTREAM_ERROR');
+    if(item.refusal)throw responseFailure('AI_REFUSAL');
+    for(const content of Array.isArray(item.content)?item.content:[]){
+      if(content?.type==='refusal'||content?.refusal)throw responseFailure('AI_REFUSAL');
+      if(content?.type==='output_text'&&typeof content.text==='string')texts.push(content.text);
+    }
   }
-  try { return JSON.parse(content); }
-  catch {
-    reply(res, 502, {error: 'AI 返回格式暂时无法读取，请重试。'});
-    return {handled: true};
+  const text=texts.join('');
+  if(!text.trim())throw responseFailure('AI_EMPTY_RESPONSE');
+  return text;
+}
+
+async function openAI(req, res, body, config) {
+  config=config||getAIConfig(res);
+  if(!config)return {handled:true};
+  const {provider,profile,apiKey,model}=config;
+  const requestBody=profile.api==='responses'?{
+    model,store:false,stream:false,instructions:body.system,input:body.user,
+    max_output_tokens:body.maxOutputTokens||24000
+  }:{
+    model,messages:[{role:'system',content:body.system},{role:'user',content:body.user}],
+    response_format:{type:'json_object'},max_tokens:body.maxTokens||15000,temperature:body.temperature??0.55
+  };
+  if(provider==='deepseek'){
+    requestBody.max_tokens=body.maxOutputTokens||24000;
+    requestBody.thinking={type:'disabled'};
+    requestBody.stream=false;
+  }
+  let response,payload;
+  try{
+    response=await fetch(profile.endpoint,{
+      method:'POST',redirect:'error',
+      headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},
+      body:JSON.stringify(requestBody),signal:AbortSignal.timeout(body.timeoutMs||270000)
+    });
+    // Keep body consumption in the same timeout/error boundary as the request.
+    const raw=await response.text();
+    const eventStream=response.headers?.get?.('content-type')?.includes('text/event-stream');
+    if(profile.api==='responses'&&response.ok&&(eventStream||/^\s*(?:event:|data:)/.test(raw)))payload=parseResponsesStream(raw);
+    else{
+      try{payload=JSON.parse(raw);}catch{
+        if(response.ok)throw responseFailure('AI_INVALID_RESPONSE');
+        payload={};
+      }
+    }
+  }catch(error){
+    const safe=['AI_INCOMPLETE_RESPONSE','AI_REFUSAL','AI_EMPTY_RESPONSE','AI_INVALID_RESPONSE','AI_UPSTREAM_ERROR'].includes(error?.code)?responseFailure(error.code):
+      {error:'暂时无法连接 AI 服务，请稍后重试。',code:'AI_CONNECTION_FAILED'};
+    reply(res,502,safe);
+    return {handled:true};
+  }
+  if(!response.ok){replyAIError(res,response.status,payload);return {handled:true};}
+  try{
+    let content;
+    if(profile.api==='responses')content=extractResponsesText(payload);
+    else{
+      const choice=payload.choices?.[0];
+      if(choice?.finish_reason==='length')throw responseFailure('AI_INCOMPLETE_RESPONSE');
+      if(choice?.message?.refusal||choice?.finish_reason==='content_filter')throw responseFailure('AI_REFUSAL');
+      if(provider==='deepseek'&&choice?.finish_reason!=='stop')throw responseFailure('AI_INCOMPLETE_RESPONSE');
+      content=choice?.message?.content;
+      if(typeof content!=='string'||!content.trim())throw responseFailure('AI_EMPTY_RESPONSE');
+    }
+    const fenced=content.match(/^\s*```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i);
+    const result=JSON.parse(fenced?fenced[1]:content);
+    if(!result||typeof result!=='object'||Array.isArray(result))throw responseFailure('AI_INVALID_RESPONSE');
+    return result;
+  }catch(error){
+    const code=['AI_INCOMPLETE_RESPONSE','AI_REFUSAL','AI_EMPTY_RESPONSE','AI_UPSTREAM_ERROR'].includes(error?.code)?error.code:'AI_INVALID_RESPONSE';
+    reply(res,502,responseFailure(code));
+    return {handled:true};
+  }
+}
+
+const MAX_TTS_AUDIO_BYTES=3*1024*1024;
+
+function ttsFailure(code) {
+  const messages={
+    TTS_NOT_CONFIGURED:'独立语音服务尚未配置完成，暂时不能生成音频。',
+    TTS_UPSTREAM_ERROR:'语音服务暂未完成请求，请稍后重试。',
+    TTS_INVALID_RESPONSE:'语音服务返回格式暂时无法读取，请稍后重试。',
+    TTS_INCOMPLETE_RESPONSE:'语音服务未完整返回音频，请稍后重试。',
+    TTS_EMPTY_RESPONSE:'语音服务没有返回可播放音频，请稍后重试。',
+    TTS_AUDIO_TOO_LARGE:'本部分音频超过可传输大小，请网站管理员调整听力文本。',
+    TTS_CONNECTION_FAILED:'暂时无法连接语音服务，请稍后重试。'
+  };
+  return {code,error:messages[code]||messages.TTS_UPSTREAM_ERROR};
+}
+
+async function collectDoubaoAudio(response) {
+  const reader=response.body?.getReader?.();
+  if(!reader)throw ttsFailure('TTS_INVALID_RESPONSE');
+  const decoder=new TextDecoder();
+  const chunks=[];
+  let pending='',audioBytes=0,wireBytes=0,finished=false;
+  const maxLineChars=4*Math.ceil(MAX_TTS_AUDIO_BYTES/3)+65536;
+  function consumeLine(line) {
+    line=line.trim();
+    if(!line)return;
+    if(line.length>maxLineChars)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+    let frame;
+    try{frame=JSON.parse(line);}catch{throw ttsFailure('TTS_INVALID_RESPONSE');}
+    if(!frame||typeof frame!=='object'||Array.isArray(frame))throw ttsFailure('TTS_INVALID_RESPONSE');
+    if(frame.code===20000000){finished=true;return;}
+    if(frame.code!==0)throw ttsFailure('TTS_UPSTREAM_ERROR');
+    if(frame.data===undefined||frame.data==='')return;
+    if(typeof frame.data!=='string'||frame.data.length%4!==0||!/^[A-Za-z0-9+/]+={0,2}$/.test(frame.data))throw ttsFailure('TTS_INVALID_RESPONSE');
+    if(frame.data.length>4*Math.ceil(MAX_TTS_AUDIO_BYTES/3))throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+    const chunk=Buffer.from(frame.data,'base64');
+    if(!chunk.length||chunk.toString('base64')!==frame.data)throw ttsFailure('TTS_INVALID_RESPONSE');
+    audioBytes+=chunk.length;
+    if(audioBytes>MAX_TTS_AUDIO_BYTES)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+    chunks.push(chunk);
+  }
+  try{
+    while(!finished){
+      const {value,done}=await reader.read();
+      if(done){
+        pending+=decoder.decode();
+        if(pending)consumeLine(pending);
+        break;
+      }
+      wireBytes+=value.byteLength;
+      if(wireBytes>MAX_TTS_AUDIO_BYTES*2)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+      pending+=decoder.decode(value,{stream:true});
+      let newline;
+      while(!finished&&(newline=pending.indexOf('\n'))!==-1){
+        const line=pending.slice(0,newline);
+        pending=pending.slice(newline+1);
+        consumeLine(line);
+      }
+      if(!finished&&pending.length>maxLineChars)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+    }
+    if(!finished)throw ttsFailure('TTS_INCOMPLETE_RESPONSE');
+    if(audioBytes===0)throw ttsFailure('TTS_EMPTY_RESPONSE');
+    return Buffer.concat(chunks,audioBytes);
+  }finally{
+    await reader.cancel().catch(()=>{});
+  }
+}
+
+async function speechAudio(res, script, config) {
+  try{
+    let response,buffer;
+    if(config.provider==='doubao'){
+      response=await fetch('https://openspeech.bytedance.com/api/v3/tts/unidirectional',{
+        method:'POST',redirect:'error',
+        headers:{'X-Api-Key':config.apiKey,'X-Api-Resource-Id':'seed-tts-2.0','X-Api-Request-Id':randomUUID(),'Content-Type':'application/json'},
+        body:JSON.stringify({req_params:{text:script,speaker:config.voice,audio_params:{format:'mp3',sample_rate:24000},additions:JSON.stringify({explicit_language:'en'})}}),
+        signal:AbortSignal.timeout(180000)
+      });
+      if(!response.ok)throw ttsFailure('TTS_UPSTREAM_ERROR');
+      buffer=await collectDoubaoAudio(response);
+    }else{
+      response=await fetch('https://api.openai.com/v1/audio/speech',{
+        method:'POST',redirect:'error',headers:{Authorization:`Bearer ${config.apiKey}`,'Content-Type':'application/json'},
+        body:JSON.stringify({model:config.model,voice:'alloy',input:script,instructions:'Read clearly in a natural British English accent at a measured exam pace.',response_format:'mp3'}),
+        signal:AbortSignal.timeout(120000)
+      });
+      if(!response.ok)throw ttsFailure('TTS_UPSTREAM_ERROR');
+      buffer=Buffer.from(await response.arrayBuffer());
+      if(!buffer.length)throw ttsFailure('TTS_EMPTY_RESPONSE');
+      if(buffer.length>MAX_TTS_AUDIO_BYTES)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
+    }
+    res.setHeader('Content-Type','audio/mpeg');
+    res.setHeader('Cache-Control','no-store');
+    return res.status(200).send(buffer);
+  }catch(error){
+    const codes=['TTS_UPSTREAM_ERROR','TTS_INVALID_RESPONSE','TTS_INCOMPLETE_RESPONSE','TTS_EMPTY_RESPONSE','TTS_AUDIO_TOO_LARGE'];
+    return reply(res,502,ttsFailure(codes.includes(error?.code)?error.code:'TTS_CONNECTION_FAILED'));
   }
 }
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') return reply(res, 405, {error: '仅支持 POST 请求。'});
   const body = req.body || {};
+  if(body.action==='capabilities')return reply(res,200,publicCapabilities());
   if (body.action === 'generate') {
     if (!validWords(body.words)) return reply(res, 400, {error: '请先导入 1 到 100 个有效训练词。'});
+    const config=getAIConfig(res);
+    if(!config)return;
     const allowed=await rateLimit(req,'generate');
     if(allowed===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
     if(!allowed)return reply(res,429,{error:'此网络今天已生成过一套练习，请明天再试。'});
@@ -154,7 +395,7 @@ module.exports = async function handler(req, res) {
     const result = await openAI(req, res, {
       system: systemPrompt,
       user: `Create one complete IELTS Academic daily practice set for this date using this vocabulary data.\n${JSON.stringify(input)}`
-    });
+    },config);
     if (result?.handled) return;
     const chart=result.writing?.task1?.chart;
     if (!result.listening?.parts || result.listening.parts.length !== 4 || result.listening.parts.some((part,index) => !part.title || !part.script || !validQuestions(part.questions,index*10+1)) ||
@@ -163,12 +404,14 @@ module.exports = async function handler(req, res) {
         !Array.isArray(result.speaking?.part1) || result.speaking.part1.length<4 || result.speaking.part1.length>5 || !result.speaking?.part2?.cueCard || !Array.isArray(result.speaking?.part3) || result.speaking.part3.length<4 || result.speaking.part3.length>5) {
       return reply(res, 502, {error: '生成结果没有达到完整试卷结构，请重试。'});
     }
-    return reply(res, 200, {date: input.date, generatedAt: new Date().toISOString(), paper: result});
+    return reply(res, 200, {date: input.date, generatedAt: new Date().toISOString(),...publicCapabilities(),paper: result});
   }
   if (body.action === 'grade-writing') {
     if (!['task1', 'task2'].includes(body.task) || typeof body.response !== 'string' || body.response.trim().length < 40 || body.response.length > 25000 || typeof body.prompt !== 'string' || body.prompt.length > 3000) {
       return reply(res, 400, {error: '请提交至少 40 个字符、且不超过 25,000 个字符的作文。'});
     }
+    const config=getAIConfig(res);
+    if(!config)return;
     const allowed=await rateLimit(req,'grade');
     if(allowed===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
     if(!allowed)return reply(res,429,{error:'评分请求较多，请一小时后再试。'});
@@ -176,31 +419,21 @@ module.exports = async function handler(req, res) {
       system: gradePrompt,
       user: JSON.stringify({task: body.task, prompt: body.prompt, response: body.response}),
       maxTokens: 2500,
+      maxOutputTokens: 4000,
       timeoutMs: 60000,
       temperature: 0.2
-    });
+    },config);
     if (result?.handled) return;
     return reply(res, 200, {feedback: result});
   }
   if (body.action === 'audio') {
     if (typeof body.script !== 'string' || body.script.trim().length < 20 || body.script.length > 8000) return reply(res, 400, {error: '听力文本长度无效。'});
-    const apiKey=getOpenAIKey(res);
-    if(!apiKey)return;
+    const config=getTTSConfig();
+    if(!config)return reply(res,503,ttsFailure('TTS_NOT_CONFIGURED'));
     const allowed=await rateLimit(req,'audio');
     if(allowed===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
     if(!allowed)return reply(res,429,{error:'音频生成请求过多，请明天再试。'});
-    let audio;
-    try{audio = await fetch('https://api.openai.com/v1/audio/speech', {
-      method: 'POST',
-      headers: {Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json'},
-      body: JSON.stringify({model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts', voice: 'alloy', input: body.script, instructions: 'Read clearly in a natural British English accent at a measured exam pace.', response_format: 'mp3'}),
-      signal: AbortSignal.timeout(120000)
-    });}catch{return reply(res,502,{error:'暂时无法连接语音服务，请稍后重试。'});}
-    if (!audio.ok) return reply(res, 502, {error: '听力音频生成失败，请稍后重试。'});
-    const buffer = Buffer.from(await audio.arrayBuffer());
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Cache-Control', 'no-store');
-    return res.status(200).send(buffer);
+    return speechAudio(res,body.script,config);
   }
   return reply(res, 400, {error: '不支持的操作。'});
 };

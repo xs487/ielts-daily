@@ -392,6 +392,8 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   const $=(selector,parent=document)=>parent.querySelector(selector);
   const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   let skill='listen',partIndex=0,writingTask='task1',busy=false,errorText='',audioUrl='',player=null;
+  let capabilities=null,capabilitiesRequest=null,capabilitiesCheckedAt=0;
+  const audioCache=new Map();
   const api=async body=>{
     const response=await fetch('/api/ielts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!response.ok){const data=await response.json().catch(()=>({}));throw new Error(data.error||`请求失败 (${response.status})`);}
@@ -400,6 +402,29 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   const app=()=>window.IELTSApp;
   const exam=()=>app()?.getAIExam();
   const save=paper=>app()?.setAIExam(paper);
+  function refreshCapabilities(force=false){
+    if(capabilitiesRequest)return capabilitiesRequest;
+    if(!force&&Date.now()-capabilitiesCheckedAt<30000)return Promise.resolve(capabilities);
+    capabilitiesCheckedAt=Date.now();
+    capabilitiesRequest=(async()=>{
+      try{
+        const response=await api({action:'capabilities'}),data=await response.json();
+        if(typeof data.audioAvailable!=='boolean')return capabilities;
+        const next={audioAvailable:data.audioAvailable,providerName:typeof data.providerName==='string'?data.providerName:'',audioProviderName:typeof data.audioProviderName==='string'?data.audioProviderName:''};
+        const changed=JSON.stringify(next)!==JSON.stringify(capabilities);
+        capabilities=next;
+        const paper=exam();
+        const audioState={audioAvailable:next.audioAvailable,audioProviderName:next.audioProviderName};
+        if(paper&&Object.keys(audioState).some(key=>paper[key]!==audioState[key]))save({...paper,...audioState});
+        if(changed&&!busy&&location.hash==='#ai'&&$('#main'))$('#main').innerHTML=render();
+        return capabilities;
+      }catch{return capabilities;}
+      finally{capabilitiesRequest=null;}
+    })();
+    return capabilitiesRequest;
+  }
+  function stopAudio(){player?.pause();player=null;}
+  function clearAudio(){stopAudio();for(const url of audioCache.values())URL.revokeObjectURL(url);audioCache.clear();audioUrl='';}
   const setError=text=>{errorText=text||'';};
   const normalize=value=>String(value??'').trim().normalize('NFKC').toLowerCase().replace(/\s+/g,' ').replace(/[.,!?。！？]/g,'');
   const countWords=text=>(String(text||'').trim().match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g)||[]).length;
@@ -426,7 +451,9 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   function listening(paper){
     const part=paper.listening.parts[partIndex]||paper.listening.parts[0];
     const questions=part.questions||[];
-    return `<div class="practice-disclosure">听力 · 4 部分 · 40 题。音频由 OpenAI 语音服务生成；作答提交后显示参考答案与解析。</div><div class="ai-part-tabs">${paper.listening.parts.map((item,index)=>`<button class="${index===partIndex?'active':''}" data-ai-action="part" data-index="${index}" aria-pressed="${index===partIndex}">Part ${index+1}<small>${item.questions.length} 题</small></button>`).join('')}</div><section class="panel ai-panel"><div class="panel-heading"><div><span class="eyebrow">LISTENING · PART ${partIndex+1}</span><h2>${esc(part.title)}</h2><p>${esc(part.scenario)}</p></div><button class="button secondary" data-ai-action="play-audio" ${busy?'disabled':''}>${busy?'正在生成音频…':'播放本部分音频'}</button></div><audio id="ai-listening-player" controls ${audioUrl?'':'hidden'} src="${esc(audioUrl)}"></audio><p class="muted">${errorText?esc(errorText):'建议先完整听一遍，再填写答案。答案与脚本在交卷前隐藏。'}</p></section><section class="panel ai-panel"><div class="ai-question-list">${questions.map(question=>questionBlock(question,'listen',paper)).join('')}</div>${score('listen',questions,paper,40)}</section>`;
+    audioUrl=audioCache.get(part.script)||'';
+    const audioAvailable=Boolean(audioUrl)||(capabilities?.audioAvailable??paper.audioAvailable)!==false;
+    return `<div class="practice-disclosure">听力 · 4 部分 · 40 题。${audioAvailable?'音频由 AI 语音服务生成。':'独立语音服务待接入，暂不能播放音频。'}作答提交后显示参考答案与解析。</div><div class="ai-part-tabs">${paper.listening.parts.map((item,index)=>`<button class="${index===partIndex?'active':''}" data-ai-action="part" data-index="${index}" aria-pressed="${index===partIndex}">Part ${index+1}<small>${item.questions.length} 题</small></button>`).join('')}</div><section class="panel ai-panel"><div class="panel-heading"><div><span class="eyebrow">LISTENING · PART ${partIndex+1}</span><h2>${esc(part.title)}</h2><p>${esc(part.scenario)}</p></div><button class="button secondary" data-ai-action="play-audio" ${busy||!audioAvailable?'disabled':''}>${!audioAvailable?'独立语音待接入':busy?'正在生成音频…':'播放本部分音频'}</button></div><audio id="ai-listening-player" controls ${audioUrl?'':'hidden'} src="${esc(audioUrl)}"></audio><p class="muted">${errorText?esc(errorText):'建议先完整听一遍，再填写答案。答案与脚本在交卷前隐藏。'}</p></section><section class="panel ai-panel"><div class="ai-question-list">${questions.map(question=>questionBlock(question,'listen',paper)).join('')}</div>${score('listen',questions,paper,40)}</section>`;
   }
   function reading(paper){
     const questions=paper.reading.questions||[];
@@ -438,14 +465,15 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   }
   function writing(paper){
     const task=paper.writing[writingTask],result=paper.grades?.[writingTask];
-    return `<div class="practice-disclosure">写作 · Academic Task 1 与 Task 2。作文提交给 OpenAI 评分服务，评分是练习估分；请勿输入真实姓名、联系方式等敏感信息。</div><div class="ai-part-tabs"><button data-ai-action="writing-task" data-task="task1" class="${writingTask==='task1'?'active':''}">Task 1</button><button data-ai-action="writing-task" data-task="task2" class="${writingTask==='task2'?'active':''}">Task 2</button></div><section class="panel ai-panel"><span class="eyebrow">WRITING ${writingTask.toUpperCase()}</span><p class="ai-writing-prompt">${esc(task.prompt)}</p>${writingTask==='task1'?chartTable(task.chart):''}<label class="ai-essay-label" for="ai-essay">你的作文</label><textarea id="ai-essay" class="essay-box" data-ai-essay="${writingTask}" placeholder="Write your response here…">${esc(paper.responses?.[writingTask]||'')}</textarea><div class="writing-counter"><span><b>${countWords(paper.responses?.[writingTask])}</b> words</span><span>${writingTask==='task1'?'建议至少 150 词':'建议至少 250 词'}</span></div><button class="button primary" data-ai-action="grade-writing" data-task="${writingTask}" ${busy?'disabled':''}>${busy?'正在分析…':'获取 AI 评分与修改建议'}</button>${errorText?`<p class="error-text" role="alert">${esc(errorText)}</p>`:''}${result?`<section class="ai-grade-result"><h3>练习估分 · ${result.overallEstimate ?? '暂无法评估'}</h3><div class="feedback-rows">${[['任务完成',result.taskResponse],['连贯衔接',result.coherenceCohesion],['词汇运用',result.lexicalResource],['语法准确',result.grammarAccuracy]].map(([label,value])=>`<div class="criterion"><span>${label}</span><strong>${esc(value??'未评估')}</strong></div>`).join('')}</div><p>${esc(result.feedback)}</p><h4>做得好的地方</h4><ul>${(result.strengths||[]).map(item=>`<li>${esc(item)}</li>`).join('')}</ul><h4>下一步重点</h4><ul>${(result.priorities||[]).map(item=>`<li>${esc(item)}</li>`).join('')}</ul>${(result.sentenceCorrections||[]).map(item=>`<div class="feedback-original"><del>${esc(item.original)}</del><br><ins>${esc(item.revision)}</ins><p>${esc(item.reason)}</p></div>`).join('')}</section>`:''}</section>`;
+    return `<div class="practice-disclosure">写作 · Academic Task 1 与 Task 2。作文提交给 网站当前配置的 AI 服务商，评分是练习估分；请勿输入真实姓名、联系方式等敏感信息。</div><div class="ai-part-tabs"><button data-ai-action="writing-task" data-task="task1" class="${writingTask==='task1'?'active':''}">Task 1</button><button data-ai-action="writing-task" data-task="task2" class="${writingTask==='task2'?'active':''}">Task 2</button></div><section class="panel ai-panel"><span class="eyebrow">WRITING ${writingTask.toUpperCase()}</span><p class="ai-writing-prompt">${esc(task.prompt)}</p>${writingTask==='task1'?chartTable(task.chart):''}<label class="ai-essay-label" for="ai-essay">你的作文</label><textarea id="ai-essay" class="essay-box" data-ai-essay="${writingTask}" placeholder="Write your response here…">${esc(paper.responses?.[writingTask]||'')}</textarea><div class="writing-counter"><span><b>${countWords(paper.responses?.[writingTask])}</b> words</span><span>${writingTask==='task1'?'建议至少 150 词':'建议至少 250 词'}</span></div><button class="button primary" data-ai-action="grade-writing" data-task="${writingTask}" ${busy?'disabled':''}>${busy?'正在分析…':'获取 AI 评分与修改建议'}</button>${errorText?`<p class="error-text" role="alert">${esc(errorText)}</p>`:''}${result?`<section class="ai-grade-result"><h3>练习估分 · ${result.overallEstimate ?? '暂无法评估'}</h3><div class="feedback-rows">${[['任务完成',result.taskResponse],['连贯衔接',result.coherenceCohesion],['词汇运用',result.lexicalResource],['语法准确',result.grammarAccuracy]].map(([label,value])=>`<div class="criterion"><span>${label}</span><strong>${esc(value??'未评估')}</strong></div>`).join('')}</div><p>${esc(result.feedback)}</p><h4>做得好的地方</h4><ul>${(result.strengths||[]).map(item=>`<li>${esc(item)}</li>`).join('')}</ul><h4>下一步重点</h4><ul>${(result.priorities||[]).map(item=>`<li>${esc(item)}</li>`).join('')}</ul>${(result.sentenceCorrections||[]).map(item=>`<div class="feedback-original"><del>${esc(item.original)}</del><br><ins>${esc(item.revision)}</ins><p>${esc(item.reason)}</p></div>`).join('')}</section>`:''}</section>`;
   }
   function speaking(paper){
     return `<div class="practice-disclosure">口语 · Part 1、2、3。复制题目和统一评分标准后，把原始录音单独发给聊天；收到反馈后仍可粘贴回本网页归档。</div><section class="panel ai-panel"><div class="panel-heading"><h2>Part 1 · Introduction and interview</h2><span class="pill neutral">${paper.speaking.part1.length} 题</span></div><ol>${paper.speaking.part1.map(item=>`<li>${esc(item)}</li>`).join('')}</ol></section><section class="panel ai-panel"><div class="panel-heading"><h2>Part 2 · Long turn</h2><span class="pill neutral">准备 1 分钟 · 陈述 1–2 分钟</span></div><div class="cue-card">${String(paper.speaking.part2.cueCard).split(/\n/).map(line=>`<p>${esc(line)}</p>`).join('')}</div></section><section class="panel ai-panel"><div class="panel-heading"><h2>Part 3 · Discussion</h2><span class="pill neutral">${paper.speaking.part3.length} 题</span></div><ol>${paper.speaking.part3.map(item=>`<li>${esc(item)}</li>`).join('')}</ol><button class="button primary" data-ai-action="copy-speaking">复制口语题目与统一评分标准</button>${errorText?`<p class="error-text" role="status">${esc(errorText)}</p>`:''}</section>`;
   }
   function render(){
+    refreshCapabilities();
     const current=exam();
-    if(!current)return `<div class="ai-practice"><div class="page-heading"><div><div class="eyebrow">IELTS ACADEMIC · DAILY PRACTICE</div><h1>今日全科练习</h1><p>根据你今天确认的词汇生成一套新的原创练习。</p></div></div><section class="panel empty-state"><div class="empty-icon">✦</div><h2>${app()?.getTodayWords().length?'生成今天的四科练习':'先导入今天的词汇'}</h2><p>生成结构包含听力 4 部分 40 题、阅读 3 篇 40 题、Task 1/2 和口语 Part 1–3。每个访客的题目会根据自己的词表生成。</p><p>点击生成后，今天的词表会发送到 OpenAI。页面在本机保存练习作答；网站不会保存你的词表。</p><button class="button primary" data-ai-action="generate" ${busy||!app()?.getTodayWords().length?'disabled':''}>${busy?'正在生成题目…':'生成今日四科练习'}</button>${errorText?`<p class="error-text" role="alert">${esc(errorText)}</p>`:''}</section></div>`;
+    if(!current)return `<div class="ai-practice"><div class="page-heading"><div><div class="eyebrow">IELTS ACADEMIC · DAILY PRACTICE</div><h1>今日全科练习</h1><p>根据你今天确认的词汇生成一套新的原创练习。</p></div></div><section class="panel empty-state"><div class="empty-icon">✦</div><h2>${app()?.getTodayWords().length?'生成今天的四科练习':'先导入今天的词汇'}</h2><p>生成结构包含听力 4 部分 40 题、阅读 3 篇 40 题、Task 1/2 和口语 Part 1–3。每个访客的题目会根据自己的词表生成。</p><p>点击生成后，今天的词表会发送给网站配置的 AI 服务商。页面在本机保存练习作答；网站不会保存你的词表。</p><button class="button primary" data-ai-action="generate" ${busy||!app()?.getTodayWords().length?'disabled':''}>${busy?'正在生成题目…':'生成今日四科练习'}</button>${errorText?`<p class="error-text" role="alert">${esc(errorText)}</p>`:''}</section></div>`;
     const views={listen:()=>listening(current),read:()=>reading(current),write:()=>writing(current),speak:()=>speaking(current)};
     return `<div class="ai-practice"><div class="page-heading"><div><div class="eyebrow">${esc(current.date||'')} · ORIGINAL PRACTICE</div><h1>今日全科练习</h1><p>参考 IELTS Academic 题型组织；原创材料与练习估分，不是官方题目或成绩。</p></div><button class="button secondary" data-ai-action="home">返回今日安排</button></div><nav class="ai-skill-tabs" aria-label="四科练习">${[['listen','听力 40'],['read','阅读 40'],['write','写作'],['speak','口语']].map(([key,label])=>`<button data-ai-action="skill" data-skill="${key}" class="${skill===key?'active':''}" aria-pressed="${skill===key}">${label}</button>`).join('')}</nav>${views[skill]()}</div>`;
   }
@@ -456,21 +484,28 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
     try{
       const response=await api({action:'generate',date:app().today(),words});
       const data=await response.json();
-      const paper={...data.paper,date:data.date,generatedAt:data.generatedAt,answers:{listen:{},read:{}},responses:{task1:'',task2:''},results:{},grades:{}};
+      const paper={...data.paper,providerName:data.providerName,audioProviderName:data.audioProviderName,audioAvailable:data.audioAvailable,date:data.date,generatedAt:data.generatedAt,answers:{listen:{},read:{}},responses:{task1:'',task2:''},results:{},grades:{}};
       if(!save(paper))throw new Error('本机存储空间不足，练习尚未保存。');
+      clearAudio();
       skill='listen';partIndex=0;location.hash='ai';setError('');
     }catch(error){setError(error.message||'生成失败，请稍后重试。');}
     finally{busy=false;if(location.hash==='#ai'&&$('#main'))$('#main').innerHTML=render();}
   }
   async function playAudio(){
     const part=exam()?.listening?.parts?.[partIndex];if(!part)return;
+    if(busy)return;
+    if(audioCache.has(part.script)){
+      stopAudio();audioUrl=audioCache.get(part.script);$('#main').innerHTML=render();player=$('#ai-listening-player');player?.play().catch(()=>{});return;
+    }
     busy=true;setError('');if($('#main'))$('#main').innerHTML=render();
     try{
+      await refreshCapabilities(true);
+      if(capabilities?.audioAvailable===false)throw new Error('听力语音服务尚未配置完成，请稍后再试。');
       const response=await api({action:'audio',script:part.script});
-      const blob=await response.blob();if(audioUrl)URL.revokeObjectURL(audioUrl);audioUrl=URL.createObjectURL(blob);
-      if(player)player.pause();
+      const blob=await response.blob();if(!blob.size)throw new Error('语音服务未返回音频，请稍后重试。');
+      stopAudio();audioUrl=URL.createObjectURL(blob);audioCache.set(part.script,audioUrl);
     }catch(error){setError(error.message||'音频生成失败。');}
-    finally{busy=false;if($('#main'))$('#main').innerHTML=render();if(audioUrl){player=$('#ai-listening-player');player?.play().catch(()=>{});}}
+    finally{busy=false;if(location.hash==='#ai'&&$('#main')){$('#main').innerHTML=render();if(audioUrl&&skill==='listen'){player=$('#ai-listening-player');player?.play().catch(()=>{});}}}
   }
   async function gradeWriting(task){
     const paper=exam(),responseText=paper?.responses?.[task]||'';
@@ -500,10 +535,11 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   document.addEventListener('click',event=>{
     const button=event.target.closest('[data-ai-action]');if(!button)return;
     const action=button.dataset.aiAction;
+    if(busy&&action!=='home')return;
     if(action==='generate'){generate();return;}
-    if(action==='home'){location.hash='home';return;}
-    if(action==='skill'){skill=button.dataset.skill;setError('');$('#main').innerHTML=render();return;}
-    if(action==='part'){partIndex=Number(button.dataset.index);setError('');audioUrl&&URL.revokeObjectURL(audioUrl);audioUrl='';$('#main').innerHTML=render();return;}
+    if(action==='home'){stopAudio();location.hash='home';return;}
+    if(action==='skill'){stopAudio();skill=button.dataset.skill;setError('');$('#main').innerHTML=render();return;}
+    if(action==='part'){stopAudio();partIndex=Number(button.dataset.index);setError('');audioUrl='';$('#main').innerHTML=render();return;}
     if(action==='writing-task'){writingTask=button.dataset.task;setError('');$('#main').innerHTML=render();return;}
     if(action==='play-audio'){playAudio();return;}
     if(action==='submit-listen'){submit('listen');return;}
@@ -518,6 +554,7 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
     const answer=event.target.closest('[data-ai-answer]');if(answer&&!exam()?.results?.[skill==='listen'?'listen':'read'])updateAnswer(skill==='listen'?'listen':'read',answer.dataset.aiAnswer,answer.value);
     const essay=event.target.closest('[data-ai-essay]');if(essay){const paper=exam();paper.responses={...(paper.responses||{}),[essay.dataset.aiEssay]:essay.value};save(paper);const count=$('.writing-counter b');if(count)count.textContent=String(countWords(essay.value));}
   });
+  window.addEventListener('hashchange',()=>{if(location.hash!=='#ai')stopAudio();});
   window.IELTSAIPractice={render,start(){
     if(!app()?.getTodayWords().length){location.hash='words';setError('请先导入并确认今天的训练词。');return;}
     const existing=exam();
