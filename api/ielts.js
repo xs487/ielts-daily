@@ -23,6 +23,20 @@ function reply(res, status, body) {
   res.status(status).json(body);
 }
 
+function getOpenAIKey(res) {
+  let key=String(process.env.OPENAI_API_KEY||'').trim();
+  if(!key){
+    reply(res,503,{error:'服务端还没有配置 OpenAI API 密钥。'});
+    return null;
+  }
+  if((key.startsWith('"')&&key.endsWith('"'))||(key.startsWith("'")&&key.endsWith("'")))key=key.slice(1,-1).trim();
+  if(!key||/[\s"']/.test(key)){
+    reply(res,503,{error:'服务端密钥格式无效，请管理员重新填写完整密钥。',code:'AI_KEY_FORMAT_INVALID'});
+    return null;
+  }
+  return key;
+}
+
 async function rateLimit(req, action) {
   const redisUrl=process.env.UPSTASH_REDIS_REST_URL;
   const redisToken=process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -89,14 +103,12 @@ function replyAIError(res, status, payload) {
 }
 
 async function openAI(req, res, body) {
-  if (!process.env.OPENAI_API_KEY) {
-    reply(res, 503, {error: '服务端还没有配置 OpenAI API 密钥。'});
-    return {handled: true};
-  }
+  const apiKey=getOpenAIKey(res);
+  if(!apiKey)return {handled:true};
   let response;
   try { response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: {Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json'},
+    headers: {Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json'},
     body: JSON.stringify({
       model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
       messages: [{role: 'system', content: body.system}, {role: 'user', content: body.user}],
@@ -172,14 +184,15 @@ module.exports = async function handler(req, res) {
   }
   if (body.action === 'audio') {
     if (typeof body.script !== 'string' || body.script.trim().length < 20 || body.script.length > 8000) return reply(res, 400, {error: '听力文本长度无效。'});
-    if (!process.env.OPENAI_API_KEY) return reply(res, 503, {error: '服务端还没有配置 OpenAI API 密钥。'});
+    const apiKey=getOpenAIKey(res);
+    if(!apiKey)return;
     const allowed=await rateLimit(req,'audio');
     if(allowed===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
     if(!allowed)return reply(res,429,{error:'音频生成请求过多，请明天再试。'});
     let audio;
     try{audio = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
-      headers: {Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json'},
+      headers: {Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json'},
       body: JSON.stringify({model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts', voice: 'alloy', input: body.script, instructions: 'Read clearly in a natural British English accent at a measured exam pace.', response_format: 'mp3'}),
       signal: AbortSignal.timeout(120000)
     });}catch{return reply(res,502,{error:'暂时无法连接语音服务，请稍后重试。'});}
