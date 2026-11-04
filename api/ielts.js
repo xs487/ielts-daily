@@ -279,7 +279,7 @@ async function openAI(req, res, body, config) {
 
 const MAX_TTS_AUDIO_BYTES=3*1024*1024;
 
-function ttsFailure(code) {
+function ttsFailure(code, diagnostic) {
   const messages={
     TTS_NOT_CONFIGURED:'独立语音服务尚未配置完成，暂时不能生成音频。',
     TTS_UPSTREAM_ERROR:'语音服务暂未完成请求，请稍后重试。',
@@ -289,12 +289,14 @@ function ttsFailure(code) {
     TTS_AUDIO_TOO_LARGE:'本部分音频超过可传输大小，请网站管理员调整听力文本。',
     TTS_CONNECTION_FAILED:'暂时无法连接语音服务，请稍后重试。'
   };
-  return {code,error:messages[code]||messages.TTS_UPSTREAM_ERROR};
+  const failure={code,error:messages[code]||messages.TTS_UPSTREAM_ERROR};
+  if(diagnostic)failure.diagnostic=diagnostic;
+  return failure;
 }
 
 async function collectDoubaoAudio(response) {
   const reader=response.body?.getReader?.();
-  if(!reader)throw ttsFailure('TTS_INVALID_RESPONSE');
+  if(!reader)throw ttsFailure('TTS_INVALID_RESPONSE','stream_missing');
   const decoder=new TextDecoder();
   const chunks=[];
   let pending='',audioBytes=0,wireBytes=0,finished=false;
@@ -304,15 +306,15 @@ async function collectDoubaoAudio(response) {
     if(!line)return;
     if(line.length>maxLineChars)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
     let frame;
-    try{frame=JSON.parse(line);}catch{throw ttsFailure('TTS_INVALID_RESPONSE');}
-    if(!frame||typeof frame!=='object'||Array.isArray(frame))throw ttsFailure('TTS_INVALID_RESPONSE');
+    try{frame=JSON.parse(line);}catch{throw ttsFailure('TTS_INVALID_RESPONSE','invalid_json');}
+    if(!frame||typeof frame!=='object'||Array.isArray(frame))throw ttsFailure('TTS_INVALID_RESPONSE','invalid_frame');
     if(frame.code===20000000){finished=true;return;}
-    if(frame.code!==0)throw ttsFailure('TTS_UPSTREAM_ERROR');
+    if(frame.code!==0)throw ttsFailure('TTS_UPSTREAM_ERROR','upstream_error_frame');
     if(frame.data===undefined||frame.data==='')return;
-    if(typeof frame.data!=='string'||frame.data.length%4!==0||!/^[A-Za-z0-9+/]+={0,2}$/.test(frame.data))throw ttsFailure('TTS_INVALID_RESPONSE');
+    if(typeof frame.data!=='string'||frame.data.length%4!==0||!/^[A-Za-z0-9+/]+={0,2}$/.test(frame.data))throw ttsFailure('TTS_INVALID_RESPONSE','invalid_audio_data');
     if(frame.data.length>4*Math.ceil(MAX_TTS_AUDIO_BYTES/3))throw ttsFailure('TTS_AUDIO_TOO_LARGE');
     const chunk=Buffer.from(frame.data,'base64');
-    if(!chunk.length||chunk.toString('base64')!==frame.data)throw ttsFailure('TTS_INVALID_RESPONSE');
+    if(!chunk.length||chunk.toString('base64')!==frame.data)throw ttsFailure('TTS_INVALID_RESPONSE','invalid_audio_data');
     audioBytes+=chunk.length;
     if(audioBytes>MAX_TTS_AUDIO_BYTES)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
     chunks.push(chunk);
@@ -336,7 +338,6 @@ async function collectDoubaoAudio(response) {
       }
       if(!finished&&pending.length>maxLineChars)throw ttsFailure('TTS_AUDIO_TOO_LARGE');
     }
-    if(!finished)throw ttsFailure('TTS_INCOMPLETE_RESPONSE');
     if(audioBytes===0)throw ttsFailure('TTS_EMPTY_RESPONSE');
     return Buffer.concat(chunks,audioBytes);
   }finally{
@@ -345,8 +346,8 @@ async function collectDoubaoAudio(response) {
 }
 
 async function speechAudio(res, script, config) {
+  let response,buffer;
   try{
-    let response,buffer;
     if(config.provider==='doubao'){
       response=await fetch('https://openspeech.bytedance.com/api/v3/tts/unidirectional',{
         method:'POST',redirect:'error',
@@ -354,7 +355,7 @@ async function speechAudio(res, script, config) {
         body:JSON.stringify({req_params:{text:script,speaker:config.voice,audio_params:{format:'mp3',sample_rate:24000},additions:JSON.stringify({explicit_language:'en'})}}),
         signal:AbortSignal.timeout(180000)
       });
-      if(!response.ok)throw ttsFailure('TTS_UPSTREAM_ERROR');
+      if(!response.ok)throw ttsFailure('TTS_UPSTREAM_ERROR','upstream_http_error');
       buffer=await collectDoubaoAudio(response);
     }else{
       response=await fetch('https://api.openai.com/v1/audio/speech',{
@@ -372,7 +373,12 @@ async function speechAudio(res, script, config) {
     return res.status(200).send(buffer);
   }catch(error){
     const codes=['TTS_UPSTREAM_ERROR','TTS_INVALID_RESPONSE','TTS_INCOMPLETE_RESPONSE','TTS_EMPTY_RESPONSE','TTS_AUDIO_TOO_LARGE'];
-    return reply(res,502,ttsFailure(codes.includes(error?.code)?error.code:'TTS_CONNECTION_FAILED'));
+    const code=codes.includes(error?.code)?error.code:'TTS_CONNECTION_FAILED';
+    if(config.provider==='doubao'){
+      const contentType=response?.headers?.get?.('content-type')||null;
+      console.warn('Doubao TTS request failed',JSON.stringify({code,diagnostic:error?.diagnostic||code,status:response?.status||null,contentType}));
+    }
+    return reply(res,502,ttsFailure(code));
   }
 }
 
