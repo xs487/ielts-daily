@@ -38,12 +38,14 @@ async function rateLimit(req, action) {
   try{
     const response=await fetch(`${redisUrl.replace(/\/$/,'')}/pipeline`,{
       method:'POST',headers:{Authorization:`Bearer ${redisToken}`,'Content-Type':'application/json'},
-      body:JSON.stringify([{command:['INCR',key]},{command:['EXPIRE',key,daily?86400:3600]}]),signal:AbortSignal.timeout(5000)
+      body:JSON.stringify([['INCR',key],['EXPIRE',key,daily?86400:3600]]),signal:AbortSignal.timeout(5000)
     });
     if(!response.ok)return null;
     const result=await response.json();
-    const count=Number(result?.[0]?.result);
-    return Number.isFinite(count)&&count<=limit;
+    if(!Array.isArray(result)||result.length!==2||result.some(item=>!item||item.error))return null;
+    const count=result[0].result;
+    if(!Number.isSafeInteger(count)||count<1||result[1].result!==1)return null;
+    return count<=limit;
   }catch{return null;}
 }
 
@@ -75,6 +77,17 @@ function validReading(reading) {
     (question.format==='text'||Array.isArray(question.options)&&question.options.length>=3&&question.options.includes(question.answer)));
 }
 
+function replyAIError(res, status, payload) {
+  if(status===401)return reply(res,502,{error:'AI 服务认证失败，请网站管理员核对服务端密钥及其所属服务商。',code:'AI_AUTH_FAILED'});
+  if(status===403)return reply(res,502,{error:'AI 服务拒绝访问，请网站管理员核对项目权限。',code:'AI_ACCESS_DENIED'});
+  if(status===429){
+    const quotaCodes=['insufficient_quota','credit_balance_exhausted','organization_spend_limit_exceeded','project_spend_limit_exceeded','organization_usage_limit_exceeded'];
+    const quota=quotaCodes.includes(payload?.error?.code)||payload?.error?.type==='insufficient_quota';
+    return reply(res,429,{error:quota?'AI 服务额度暂不可用，请网站管理员检查账户配置。':'AI 服务请求繁忙，请稍后重试。',code:quota?'AI_QUOTA_UNAVAILABLE':'AI_RATE_LIMITED'});
+  }
+  return reply(res,502,{error:'AI 服务暂未完成请求，请稍后重试；如持续失败，请网站管理员核对模型配置。',code:'AI_UPSTREAM_ERROR'});
+}
+
 async function openAI(req, res, body) {
   if (!process.env.OPENAI_API_KEY) {
     reply(res, 503, {error: '服务端还没有配置 OpenAI API 密钥。'});
@@ -91,15 +104,14 @@ async function openAI(req, res, body) {
       max_tokens: body.maxTokens || 15000,
       temperature: body.temperature ?? 0.55
     }),
-    signal: AbortSignal.timeout(120000)
+    signal: AbortSignal.timeout(body.timeoutMs || 270000)
   }); } catch {
     reply(res, 502, {error: '暂时无法连接 AI 服务，请稍后重试。'});
     return {handled: true};
   }
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const detail = payload.error?.message || `OpenAI returned ${response.status}`;
-    reply(res, response.status === 429 ? 429 : 502, {error: `AI 请求失败：${detail}`});
+    replyAIError(res,response.status,payload);
     return {handled: true};
   }
   const content = payload.choices?.[0]?.message?.content;
@@ -152,6 +164,7 @@ module.exports = async function handler(req, res) {
       system: gradePrompt,
       user: JSON.stringify({task: body.task, prompt: body.prompt, response: body.response}),
       maxTokens: 2500,
+      timeoutMs: 60000,
       temperature: 0.2
     });
     if (result?.handled) return;
