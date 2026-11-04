@@ -13,10 +13,11 @@ Writing must contain an Academic Task 1 visual-data prompt with coherent categor
 
 Speaking must include 4-5 Part 1 interview questions, one IELTS-style Part 2 cue card with 3-4 bullets and a final explain question, and 4-5 increasingly analytical Part 3 questions related to Part 2.
 
-Return valid JSON only. Do not put answers or listening scripts in learner-facing prompts; scripts and answers belong only in their specified fields. Do not fabricate official band conversions.`;
+Before returning, verify every required part and exact question number/count, passage linkage, readable text length, chart series, and speaking prompt. If a requirement is missing, correct the JSON before returning. Return valid JSON only. Do not put answers or listening scripts in learner-facing prompts; scripts and answers belong only in their specified fields. Do not fabricate official band conversions.`;
 
 const gradePrompt = `Evaluate the supplied IELTS Academic writing response as cautious practice feedback, not an official score. Return JSON only with this shape: {"taskResponse":number,"coherenceCohesion":number,"lexicalResource":number,"grammarAccuracy":number,"overallEstimate":number,"strengths":[string],"priorities":[string],"sentenceCorrections":[{"original":string,"revision":string,"reason":string}],"feedback":string}. Scores must be half bands from 0 to 9. Cite evidence from the response. For Task 1, assess task achievement; for Task 2, assess task response. State when the response is too short to assess reliably. Write strengths, priorities, correction reasons, and feedback in simplified Chinese; keep quoted original sentences, revised sentences, and the exam prompt in English.`;
 
+// DeepSeek's current API alias deepseek-flash serves DeepSeek-V4.1-Flash-1017.
 const providerProfiles = Object.freeze({
   openai: Object.freeze({endpoint:'https://api.openai.com/v1/chat/completions',api:'chat',defaultModel:'gpt-4o-mini',modelEnv:'OPENAI_MODEL'}),
   wawazz: Object.freeze({endpoint:'https://wawazz.xyz/v1/responses',api:'responses',defaultModel:'gpt-5.6-terra',modelEnv:'WAWAZZ_MODEL'}),
@@ -117,6 +118,60 @@ async function rateLimit(req, action) {
   }catch{return null;}
 }
 
+const generationReservationScript=`
+local operation=ARGV[1]
+local token=ARGV[2]
+if operation=='reserve' then
+  if redis.call('EXISTS',KEYS[2])==1 then return 0 end
+  if redis.call('SET',KEYS[1],token,'NX','EX',ARGV[3]) then return 1 end
+  return 0
+end
+if redis.call('GET',KEYS[1])~=token then return -1 end
+if operation=='commit' then
+  redis.call('SET',KEYS[2],'1','EX',ARGV[3])
+  redis.call('DEL',KEYS[1])
+  return 1
+end
+redis.call('DEL',KEYS[1])
+return 1
+`;
+
+function generationQuotaKeys(req) {
+  const forwarded=req.headers['x-forwarded-for'];
+  const ip=typeof forwarded==='string'?forwarded.split(',')[0].trim():'unknown';
+  const hash=createHash('sha256').update(ip).digest('hex').slice(0,24);
+  const day=new Date().toISOString().slice(0,10);
+  const base=`ielts:generate:v2:${hash}:${day}`;
+  return {pending:`${base}:pending`,used:`${base}:used`};
+}
+
+async function generationReservation(req, operation, reservation) {
+  const redisUrl=process.env.UPSTASH_REDIS_REST_URL;
+  const redisToken=process.env.UPSTASH_REDIS_REST_TOKEN;
+  if(!redisUrl||!redisToken)return null;
+  const keys=operation==='reserve'?generationQuotaKeys(req):reservation?.keys;
+  const reservationToken=operation==='reserve'?randomUUID():reservation?.token;
+  if(!keys||!reservationToken)return null;
+  const args=operation==='reserve'
+    ?['reserve',reservationToken,'360']
+    :operation==='commit'?['commit',reservationToken,'86400']
+      :['release',reservationToken];
+  const command=['EVAL',generationReservationScript,'2',keys.pending,keys.used,...args];
+  try{
+    const response=await fetch(`${redisUrl.replace(/\/$/,'')}/pipeline`,{
+      method:'POST',redirect:'error',headers:{Authorization:`Bearer ${redisToken}`,'Content-Type':'application/json'},
+      body:JSON.stringify([command]),signal:AbortSignal.timeout(5000)
+    });
+    if(!response.ok)return null;
+    const result=await response.json();
+    if(!Array.isArray(result)||result.length!==1||!result[0]||result[0].error)return null;
+    const outcome=result[0].result;
+    if(!Number.isSafeInteger(outcome))return null;
+    if(operation==='reserve')return outcome===1?{token:reservationToken,keys}:outcome===0?false:null;
+    return outcome===1;
+  }catch{return null;}
+}
+
 function validWords(words) {
   return Array.isArray(words) && words.length >= 1 && words.length <= 100 && words.every(item =>
     item && typeof item.word === 'string' && item.word.trim().length > 0 && item.word.length <= 120 &&
@@ -137,12 +192,33 @@ function wordCount(value) { return (String(value||'').match(/[A-Za-z0-9]+(?:['�
 
 function validReading(reading) {
   if(!Array.isArray(reading?.passages)||reading.passages.length!==3||!Array.isArray(reading.questions)||reading.questions.length!==40)return false;
+  if(reading.passages.some(passage=>!passage||typeof passage.id!=='string'||typeof passage.title!=='string'||typeof passage.text!=='string'))return false;
   const passageIds=reading.passages.map(passage=>passage.id);
   const totalWords=reading.passages.reduce((sum,passage)=>sum+wordCount(passage.text),0);
   if(new Set(passageIds).size!==3||reading.passages.some(passage=>!passage.title||!passage.text)||totalWords<1900||totalWords>2800)return false;
   return reading.questions.every((question,index)=>question&&question.number===index+1&&question.prompt&&question.answer&&question.explanation&&
     ['text','choice','tfng'].includes(question.format)&&passageIds.includes(question.passageId)&&
     (question.format==='text'||Array.isArray(question.options)&&question.options.length>=3&&question.options.includes(question.answer)));
+}
+
+function paperStructureIssues(paper) {
+  const issues=[];
+  const parts=paper?.listening?.parts;
+  if(!Array.isArray(parts)||parts.length!==4)issues.push(`listening_parts:${Array.isArray(parts)?parts.length:0}`);
+  else parts.forEach((part,index)=>{
+    if(!part?.title||!part?.script)issues.push(`listening_part_${index+1}_content`);
+    if(!validQuestions(part?.questions,index*10+1))issues.push(`listening_part_${index+1}_questions:${Array.isArray(part?.questions)?part.questions.length:0}`);
+  });
+  const reading=paper?.reading;
+  if(!Array.isArray(reading?.passages)||reading.passages.length!==3)issues.push(`reading_passages:${Array.isArray(reading?.passages)?reading.passages.length:0}`);
+  if(!Array.isArray(reading?.questions)||reading.questions.length!==40)issues.push(`reading_questions:${Array.isArray(reading?.questions)?reading.questions.length:0}`);
+  else if(!validReading(reading))issues.push('reading_content_or_question_validation');
+  const task1=paper?.writing?.task1;
+  const chart=task1?.chart;
+  if(typeof task1?.prompt!=='string'||!task1.prompt.trim()||typeof paper?.writing?.task2?.prompt!=='string'||!paper.writing.task2.prompt.trim()||!Array.isArray(chart?.categories)||chart.categories.length<4||!Array.isArray(chart?.series)||chart.series.length<2||chart.series.some(series=>!series||!Array.isArray(series.values)||series.values.length!==chart.categories.length))issues.push('writing_tasks_or_chart');
+  const speaking=paper?.speaking;
+  if(!Array.isArray(speaking?.part1)||speaking.part1.length<4||speaking.part1.length>5||speaking.part1.some(question=>typeof question!=='string'||!question.trim())||typeof speaking?.part2?.cueCard!=='string'||!speaking.part2.cueCard.trim()||!Array.isArray(speaking?.part3)||speaking.part3.length<4||speaking.part3.length>5||speaking.part3.some(question=>typeof question!=='string'||!question.trim()))issues.push('speaking_parts');
+  return issues;
 }
 
 function replyAIError(res, status, payload) {
@@ -215,7 +291,12 @@ function extractResponsesText(payload) {
   return text;
 }
 
-async function openAI(req, res, body, config) {
+async function openAI(req, res, body, config, deferErrors=false) {
+  const fail=(status,payload)=>{
+    if(deferErrors)return {handled:true,failure:{status,body:payload}};
+    reply(res,status,payload);
+    return {handled:true};
+  };
   config=config||getAIConfig(res);
   if(!config)return {handled:true};
   const {provider,profile,apiKey,model}=config;
@@ -224,7 +305,7 @@ async function openAI(req, res, body, config) {
     max_output_tokens:body.maxOutputTokens||24000
   }:{
     model,messages:[{role:'system',content:body.system},{role:'user',content:body.user}],
-    response_format:{type:'json_object'},max_tokens:body.maxTokens||15000,temperature:body.temperature??0.55
+    response_format:{type:'json_object'},max_tokens:body.maxTokens||body.maxOutputTokens||15000,temperature:body.temperature??0.55
   };
   if(provider==='deepseek'){
     requestBody.max_tokens=body.maxOutputTokens||24000;
@@ -251,10 +332,17 @@ async function openAI(req, res, body, config) {
   }catch(error){
     const safe=['AI_INCOMPLETE_RESPONSE','AI_REFUSAL','AI_EMPTY_RESPONSE','AI_INVALID_RESPONSE','AI_UPSTREAM_ERROR'].includes(error?.code)?responseFailure(error.code):
       {error:'暂时无法连接 AI 服务，请稍后重试。',code:'AI_CONNECTION_FAILED'};
-    reply(res,502,safe);
+    return fail(502,safe);
+  }
+  if(!response.ok){
+    if(deferErrors){
+      const temporary={setHeader(){},status(status){this.statusCode=status;return this;},json(body){this.body=body;return this;}};
+      replyAIError(temporary,response.status,payload);
+      return {handled:true,failure:{status:temporary.statusCode,body:temporary.body}};
+    }
+    replyAIError(res,response.status,payload);
     return {handled:true};
   }
-  if(!response.ok){replyAIError(res,response.status,payload);return {handled:true};}
   try{
     let content;
     if(profile.api==='responses')content=extractResponsesText(payload);
@@ -272,8 +360,7 @@ async function openAI(req, res, body, config) {
     return result;
   }catch(error){
     const code=['AI_INCOMPLETE_RESPONSE','AI_REFUSAL','AI_EMPTY_RESPONSE','AI_UPSTREAM_ERROR'].includes(error?.code)?error.code:'AI_INVALID_RESPONSE';
-    reply(res,502,responseFailure(code));
-    return {handled:true};
+    return fail(502,responseFailure(code));
   }
 }
 
@@ -395,26 +482,51 @@ module.exports = async function handler(req, res) {
     if (!validWords(body.words)) return reply(res, 400, {error: '请先导入 1 到 100 个有效训练词。'});
     const config=getAIConfig(res);
     if(!config)return;
-    const allowed=await rateLimit(req,'generate');
-    if(allowed===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
-    if(!allowed)return reply(res,429,{error:'此网络今天已生成过一套练习，请明天再试。'});
+    const reservation=await generationReservation(req,'reserve');
+    if(reservation===null)return reply(res,503,{error:'练习服务尚未配置安全的访问限额。'});
+    if(reservation===false)return reply(res,429,{error:'此网络今天已生成过一套练习，或已有生成任务正在进行。'});
     const input = {
       date: typeof body.date === 'string' ? body.date.slice(0, 10) : '',
       targetBand: 7,
       vocabulary: body.words.map(item => ({word: item.word.trim(), meaning: String(item.meaning || '').slice(0, 240)}))
     };
-    const result = await openAI(req, res, {
+    let result = await openAI(req, res, {
       system: systemPrompt,
-      user: `Create one complete IELTS Academic daily practice set for this date using this vocabulary data.\n${JSON.stringify(input)}`
-    },config);
-    if (result?.handled) return;
-    const chart=result.writing?.task1?.chart;
-    if (!result.listening?.parts || result.listening.parts.length !== 4 || result.listening.parts.some((part,index) => !part.title || !part.script || !validQuestions(part.questions,index*10+1)) ||
-        !validReading(result.reading) ||
-        !result.writing?.task1?.prompt || !result.writing?.task2?.prompt || !Array.isArray(chart?.categories)||chart.categories.length<4||!Array.isArray(chart?.series)||chart.series.length<2||chart.series.some(series=>!Array.isArray(series.values)||series.values.length!==chart.categories.length) ||
-        !Array.isArray(result.speaking?.part1) || result.speaking.part1.length<4 || result.speaking.part1.length>5 || !result.speaking?.part2?.cueCard || !Array.isArray(result.speaking?.part3) || result.speaking.part3.length<4 || result.speaking.part3.length>5) {
-      return reply(res, 502, {error: '生成结果没有达到完整试卷结构，请重试。'});
+      user: `Create one complete IELTS Academic daily practice set for this date using this vocabulary data.\n${JSON.stringify(input)}`,
+      maxOutputTokens:32000,
+      timeoutMs:180000
+    },config,true);
+    if(result?.handled){
+      const released=await generationReservation(req,'release',reservation);
+      if(released!==true)return reply(res,503,{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
+      if(result.failure)return reply(res,result.failure.status,result.failure.body);
+      return;
     }
+    let issues=paperStructureIssues(result);
+    if(issues.length){
+      console.warn('Generated IELTS paper failed structure checks',JSON.stringify(issues));
+      result=await openAI(req,res,{
+        system:`${systemPrompt}\nA previous draft failed these structural checks: ${issues.join(', ')}. Regenerate the entire paper from scratch and satisfy every listed check exactly. Before returning JSON, verify all required array lengths, numbering, passage word count, passage references, chart data, and speaking parts.`,
+        user:`Create a complete IELTS Academic daily practice set for this date. Use the supplied vocabulary naturally.\n${JSON.stringify(input)}`,
+        maxOutputTokens:32000,
+        timeoutMs:90000
+      },config,true);
+      if(result?.handled){
+        const released=await generationReservation(req,'release',reservation);
+        if(released!==true)return reply(res,503,{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
+        if(result.failure)return reply(res,result.failure.status,result.failure.body);
+        return;
+      }
+      issues=paperStructureIssues(result);
+      if(issues.length){
+        console.warn('Generated IELTS paper retry failed structure checks',JSON.stringify(issues));
+        const released=await generationReservation(req,'release',reservation);
+        if(released!==true)return reply(res,503,{error:'生成结果仍不完整，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
+        return reply(res,502,{error:'生成结果仍未达到完整试卷结构，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'});
+      }
+    }
+    const committed=await generationReservation(req,'commit',reservation);
+    if(committed!==true)return reply(res,503,{error:'试卷已生成，但暂时无法确认保存今日名额，请稍后刷新状态。',code:'GENERATION_QUOTA_COMMIT_FAILED'});
     return reply(res, 200, {date: input.date, generatedAt: new Date().toISOString(),...publicCapabilities(),paper: result});
   }
   if (body.action === 'grade-writing') {
