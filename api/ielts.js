@@ -311,7 +311,10 @@ async function collectDoubaoAudio(response) {
     if(frame.code===20000000){finished=true;return;}
     if(frame.code!==0)throw ttsFailure('TTS_UPSTREAM_ERROR','upstream_error_frame');
     if(frame.data===undefined||frame.data==='')return;
-    if(typeof frame.data!=='string')throw ttsFailure('TTS_INVALID_RESPONSE','invalid_audio_data_type');
+    if(typeof frame.data!=='string'){
+      const shape=Array.isArray(frame.data)?`array_${frame.data.length}`:frame.data===null?'null':typeof frame.data==='object'?`object_${Object.keys(frame.data).length}`:typeof frame.data;
+      throw ttsFailure('TTS_INVALID_RESPONSE',`invalid_audio_data_type_${shape}`);
+    }
     if(frame.data.length%4===1||!/^[A-Za-z0-9+/]*={0,2}$/.test(frame.data))throw ttsFailure('TTS_INVALID_RESPONSE','invalid_audio_data_alphabet');
     if(frame.data.length>4*Math.ceil(MAX_TTS_AUDIO_BYTES/3))throw ttsFailure('TTS_AUDIO_TOO_LARGE');
     const encoded=frame.data.padEnd(Math.ceil(frame.data.length/4)*4,'=');
