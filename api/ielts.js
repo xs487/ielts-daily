@@ -2,7 +2,9 @@ const {createHash,randomUUID} = require('node:crypto');
 
 const practiceBase = `Create original IELTS Academic practice at approximately Band 7 level. Never claim it is an official IELTS paper or copy remembered test material. Use supplied vocabulary naturally where it fits. Return valid JSON only. Keep answers and explanations out of learner-facing prompts.`;
 
-const listeningPartPrompt = `${practiceBase} Create exactly one Listening part with this shape: {"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Write a complete natural dialogue or monologue of 650-850 words, at most 8000 characters, appropriate to the specified part. Create exactly 10 questions using the supplied number range. Use form/note completion, multiple choice and short answer. Do not use TRUE/FALSE/NOT GIVEN or YES/NO/NOT GIVEN; these are Reading formats. For choice use 3 options and make answer exactly match the correct option. Every question needs an unambiguous answer and concise explanation. State a clear word limit for text-answer questions. Before returning, verify script length, exactly 10 sequential numbers, and that every question is answerable from the script.`;
+const listeningScriptPrompt = `${practiceBase} Create exactly one complete IELTS Listening script with this shape: {"title":"","scenario":"","script":""}. Write a natural dialogue or monologue of 750-950 words, at most 8000 characters, appropriate to the specified part. Develop the topic fully with concrete details, corrections, comparisons and plausible distractors for a separate set of ten questions. Do not include questions or answers in the output. Before returning, count the words and expand any draft shorter than 750 words.`;
+
+const listeningQuestionsPrompt = `${practiceBase} Create exactly 10 IELTS Listening questions for the supplied script with this shape: {"questions":[{"number":1,"format":"text|choice","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Use the supplied sequential number range. Use form/note completion, multiple choice and short answer. Do not use TRUE/FALSE/NOT GIVEN or YES/NO/NOT GIVEN; these are Reading formats. For choice use 3 options and make answer exactly match the correct option. Every question needs an unambiguous answer and concise explanation. State a clear word limit for text-answer questions. Base answers on the script and order questions to follow it. Return questions only; do not repeat the script.`;
 
 const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""}}. Passage text must contain 650-900 words. Use the supplied passage ID. Develop a coherent academic argument or explanation with enough specific evidence for a separate reading question set. Return the passage only.`;
 
@@ -199,9 +201,17 @@ function validReading(reading) {
 }
 
 function moduleIssues(module, value) {
-  if(module.kind==='listening'){
+  if(module.kind==='listening-script'){
     const issues=[];
-    if(typeof value?.title!=='string'||!value.title.trim()||typeof value?.scenario!=='string'||!value.scenario.trim()||typeof value?.script!=='string'||wordCount(value.script)<550||value.script.length>8000)issues.push('part_content_or_length');
+    if(typeof value?.title!=='string'||!value.title.trim()||typeof value?.scenario!=='string'||!value.scenario.trim()||typeof value?.script!=='string')issues.push('part_content');
+    else {
+      if(wordCount(value.script)<550)issues.push(`script_too_short:${wordCount(value.script)}_words;minimum_550_target_750_to_950`);
+      if(value.script.length>8000)issues.push(`script_too_long:${value.script.length}_characters;maximum_8000`);
+    }
+    return issues;
+  }
+  if(module.kind==='listening-questions'){
+    const issues=[];
     if(!validQuestions(value?.questions,module.firstNumber))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
     else if(value.questions.some(question=>question.format==='tfng'))issues.push('listening_format_must_be_text_or_choice');
     return issues;
@@ -521,7 +531,7 @@ module.exports = async function handler(req, res) {
     for(let index=0;index<4;index++){
       const part=index+1,firstNumber=index*10+1;
       const partInstruction=part===1?'Part 1 is a two-person everyday conversation with form or note completion.':part===2?'Part 2 is one speaker describing a social situation, often with a map or process.':part===3?'Part 3 is an academic discussion between students and/or a tutor.':'Part 4 is a single-speaker academic lecture with note completion.';
-      modules.push({name:`listening_part_${part}`,kind:'listening',part,firstNumber,maxOutputTokens:7000,system:`${listeningPartPrompt} ${partInstruction}`,user:JSON.stringify({module:{kind:'listening',part,firstNumber,count:10},...input})});
+      modules.push({name:`listening_part_${part}`,kind:'listening-script',part,firstNumber,maxOutputTokens:4000,system:`${listeningScriptPrompt} ${partInstruction}`,user:JSON.stringify({module:{kind:'listening-script',part},...input})});
     }
     const readingCounts=[13,13,14];
     let firstReadingQuestion=1;
@@ -587,7 +597,11 @@ module.exports = async function handler(req, res) {
       firstNumber+=count;
       return module;
     });
-    const generatedQuestions=await Promise.all(questionModules.map(generateModule));
+    const listeningQuestionModules=firstValues.slice(0,4).map((part,index)=>{
+      const firstNumber=index*10+1;
+      return {name:`listening_questions_${index+1}`,kind:'listening-questions',part:index+1,firstNumber,maxOutputTokens:6000,system:listeningQuestionsPrompt,user:JSON.stringify({module:{kind:'listening-questions',part:index+1,firstNumber,count:10},script:part.script,...input})};
+    });
+    const generatedQuestions=await Promise.all([...listeningQuestionModules,...questionModules].map(generateModule));
     const questionFailure=await finishFailedModules(generatedQuestions);
     if(questionFailure)return reply(res,questionFailure.status,questionFailure.body);
     const values=generatedQuestions.map(item=>item.value);
@@ -596,8 +610,8 @@ module.exports = async function handler(req, res) {
     const task1=firstValues[7].writing.task1;
     task1.prompt=`The table below compares ${task1.chart.series.map(series=>series.name).join(' and ')} across the categories shown.\n\nSummarise the information by selecting and reporting the main features, and make comparisons where relevant.\n\nYou should write at least 150 words.`;
     const result={
-      listening:{parts:firstValues.slice(0,4)},
-      reading:{passages,questions:values.flatMap(item=>item.questions)},
+      listening:{parts:firstValues.slice(0,4).map((part,index)=>({...part,questions:values[index].questions}))},
+      reading:{passages,questions:values.slice(4).flatMap(item=>item.questions)},
       ...firstValues[7]
     };
     const issues=paperStructureIssues(result);
