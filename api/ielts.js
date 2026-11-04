@@ -2,7 +2,7 @@ const {createHash,randomUUID} = require('node:crypto');
 
 const practiceBase = `Create original IELTS Academic practice at approximately Band 7 level. Never claim it is an official IELTS paper or copy remembered test material. Use supplied vocabulary naturally where it fits. Return valid JSON only. Keep answers and explanations out of learner-facing prompts.`;
 
-const listeningPartPrompt = `${practiceBase} Create exactly one Listening part with this shape: {"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Write a complete natural dialogue or monologue appropriate to the specified part. Create exactly 10 questions using the supplied number range. Vary form/note completion, multiple choice, short answer and directions when appropriate. For choice/tfng use 3 options; for choice, answer must exactly match the correct option. Every question needs an unambiguous answer and concise explanation. Before returning, verify the part has exactly 10 sequential numbers and every question is answerable from the script.`;
+const listeningPartPrompt = `${practiceBase} Create exactly one Listening part with this shape: {"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Write a complete natural dialogue or monologue of 650-850 words, at most 8000 characters, appropriate to the specified part. Create exactly 10 questions using the supplied number range. Use form/note completion, multiple choice and short answer. Do not use TRUE/FALSE/NOT GIVEN or YES/NO/NOT GIVEN; these are Reading formats. For choice use 3 options and make answer exactly match the correct option. Every question needs an unambiguous answer and concise explanation. State a clear word limit for text-answer questions. Before returning, verify script length, exactly 10 sequential numbers, and that every question is answerable from the script.`;
 
 const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""}}. Passage text must contain 650-900 words. Use the supplied passage ID. Develop a coherent academic argument or explanation with enough specific evidence for a separate reading question set. Return the passage only.`;
 
@@ -201,8 +201,9 @@ function validReading(reading) {
 function moduleIssues(module, value) {
   if(module.kind==='listening'){
     const issues=[];
-    if(typeof value?.title!=='string'||!value.title.trim()||typeof value?.scenario!=='string'||!value.scenario.trim()||typeof value?.script!=='string'||wordCount(value.script)<120)issues.push('part_content');
+    if(typeof value?.title!=='string'||!value.title.trim()||typeof value?.scenario!=='string'||!value.scenario.trim()||typeof value?.script!=='string'||wordCount(value.script)<550||value.script.length>8000)issues.push('part_content_or_length');
     if(!validQuestions(value?.questions,module.firstNumber))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
+    else if(value.questions.some(question=>question.format==='tfng'))issues.push('listening_format_must_be_text_or_choice');
     return issues;
   }
   if(module.kind==='reading'){
@@ -590,6 +591,10 @@ module.exports = async function handler(req, res) {
     const questionFailure=await finishFailedModules(generatedQuestions);
     if(questionFailure)return reply(res,questionFailure.status,questionFailure.body);
     const values=generatedQuestions.map(item=>item.value);
+    // The UI renders a table, so derive its instruction from the validated data
+    // instead of trusting a separate model-written count or chart description.
+    const task1=firstValues[7].writing.task1;
+    task1.prompt=`The table below compares ${task1.chart.series.map(series=>series.name).join(' and ')} across the categories shown.\n\nSummarise the information by selecting and reporting the main features, and make comparisons where relevant.\n\nYou should write at least 150 words.`;
     const result={
       listening:{parts:firstValues.slice(0,4)},
       reading:{passages,questions:values.flatMap(item=>item.questions)},
