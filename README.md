@@ -17,7 +17,7 @@ IELTS Academic 每日词汇练习网站：浏览器本地识别截图、核对�
 | `OPENAI_MODEL` | 官方模式文本模型，可选，默认 `gpt-4o-mini` |
 | `WAWAZZ_MODEL` | WAWA ZZ 模式文本模型，可选，默认 `gpt-5.6-terra` |
 | `DEEPSEEK_API_KEY` | DeepSeek 模式必填的独立官方密钥，不会回退使用 `OPENAI_API_KEY` |
-| `DEEPSEEK_MODEL` | DeepSeek 模式文本模型，可选，默认 `deepseek-flash`，也支持 `deepseek-v4-pro` |
+| `DEEPSEEK_MODEL` | DeepSeek 模式文本模型，可选，默认 `deepseek-flash`（官方当前映射到 DeepSeek-V4.1-Flash-1017），也支持 `deepseek-v4-pro` |
 | `TTS_PROVIDER` | 独立语音服务：`doubao`、`openai` 或 `none`；未设时，仅文本服务为 OpenAI 时兼容旧版 OpenAI 语音配置，其他模式不启用语音 |
 | `DOUBAO_TTS_API_KEY` | `doubao` 模式必填，在豆包语音新控制台创建的 API Key；不是火山方舟文本模型 Key |
 | `DOUBAO_TTS_VOICE` | 可选，默认豆包 2.0 英式英语男声 `ICL_uranus_en_male_alastor_tob`，需在账号中开通该音色和资源 |
@@ -36,9 +36,9 @@ IELTS Academic 每日词汇练习网站：浏览器本地识别截图、核对�
 
 ## 请求与数据
 
-Upstash 只保存哈希 IP 和请求计数，用于限制每个 IP 每天生成一套题、每天生成四次听力音频、每小时提交八次作文评分。限额配置缺失或不可用时，AI 接口拒绝请求。密钥格式及服务商配置会在限额计数前校验。
+Upstash 只保存哈希 IP、生成预留状态和请求计数，用于限制每个 IP 每天成功生成一套题、每天生成四次听力音频、每小时提交八次作文评分。整卷生成先原子预留名额，完整试卷通过校验后才提交；模型失败或结构不合格会释放预留。未完成的预留最多保留六分钟。限额配置缺失或不可用时，AI 接口拒绝请求。密钥格式及服务商配置会在限额计数前校验。
 
-Vercel 函数最长运行 300 秒，整套出题请求最多等待 270 秒（含读取响应体），作文评分最多等待 60 秒，豆包语音最多等待 180 秒，OpenAI 语音最多等待 120 秒。每段音频最多 3 MiB，以控制 Vercel 响应大小；听力文本最多 8,000 字符。DeepSeek / WAWA ZZ 默认整套最多输出 24,000 token、作文反馈最多输出 4,000 token；后端仅提取最终文字内容，忽略 reasoning，并拒绝不完整、失败或拒答结果。DeepSeek 的 `finish_reason` 必须为 `stop` 才会接受结果。作文解释和提升建议使用中文，英文原句及修改后的句子保持英语。
+Vercel 函数最长运行 300 秒，整套出题分两阶段并行生成听力、三篇阅读正文及其题组、写作和口语模块；每个模块至多自动重试一次，总等待上限约 270 秒。阅读三篇各 650–900 词，共 40 题。作文评分最多等待 60 秒，豆包语音最多等待 180 秒，OpenAI 语音最多等待 120 秒。每段音频最多 3 MiB，以控制 Vercel 响应大小；听力文本最多 8,000 字符。DeepSeek / WAWA ZZ 每个生成模块最多输出 7,000 token、作文反馈最多输出 4,000 token；后端仅提取最终文字内容，忽略 reasoning，并拒绝不完整、失败或拒答结果。DeepSeek 的 `finish_reason` 必须为 `stop` 才会接受结果。作文解释和提升建议使用中文，英文原句及修改后的句子保持英语。
 
 DeepSeek 参数依据：[首次调用](https://api-docs.deepseek.com/zh-cn/)、[模型与价格](https://api-docs.deepseek.com/zh-cn/quick_start/pricing)、[Chat Completions API](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion)。
 

@@ -4,7 +4,9 @@ const practiceBase = `Create original IELTS Academic practice at approximately B
 
 const listeningPartPrompt = `${practiceBase} Create exactly one Listening part with this shape: {"title":"","scenario":"","script":"","questions":[{"number":1,"format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":""}]}. Write a complete natural dialogue or monologue appropriate to the specified part. Create exactly 10 questions using the supplied number range. Vary form/note completion, multiple choice, short answer and directions when appropriate. For choice/tfng use 3 options; for choice, answer must exactly match the correct option. Every question needs an unambiguous answer and concise explanation. Before returning, verify the part has exactly 10 sequential numbers and every question is answerable from the script.`;
 
-const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage and its assigned questions. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""},"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]}. Passage text must contain 650-900 words. Create exactly the requested question count and number range, all linked to the supplied passage ID. Use a mix of TRUE/FALSE/NOT GIVEN, multiple choice and short/sentence completion. For choice/tfng include 3 options and make answer exactly one option; provide acceptable variants for text answers. Every item must be answerable from the passage and include a short evidence quote.`;
+const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""}}. Passage text must contain 650-900 words. Use the supplied passage ID. Develop a coherent academic argument or explanation with enough specific evidence for a separate reading question set. Return the passage only.`;
+
+const readingQuestionsPrompt = `${practiceBase} Create IELTS Academic reading questions for the supplied passage. Output exactly this shape: {"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]}. Create exactly the requested question count and number range, all linked to the supplied passage ID. Use a mix of TRUE/FALSE/NOT GIVEN, multiple choice and short/sentence completion. For choice/tfng include 3 options and make answer exactly one option; provide acceptable variants for text answers. Every item must be answerable from the passage and include a short evidence quote. Do not repeat the passage in the output.`;
 
 const writingSpeakingPrompt = `${practiceBase} Create original IELTS Academic Writing Task 1 and Task 2 prompts plus Speaking Parts 1-3. Output exactly this shape: {"writing":{"task1":{"prompt":"","chart":{"title":"","categories":["","","",""],"series":[{"name":"","values":[1,2,3,4]},{"name":"","values":[4,3,2,1]}]}},"task2":{"prompt":""}},"speaking":{"part1":[""],"part2":{"cueCard":""},"part3":[""]}}. Task 1 must describe a coherent visual with at least four categories and at least two numeric series, and its prompt must match the data. Task 2 must be an answerable discussion or argument prompt. Speaking Part 1 and Part 3 need 4-5 questions each; Part 2 needs a cue card with 3-4 bullets and a final explain question. Part 3 should extend the Part 2 topic into broader analysis.`;
 
@@ -204,10 +206,15 @@ function moduleIssues(module, value) {
     return issues;
   }
   if(module.kind==='reading'){
-    const issues=[];
     const passage=value?.passage;
+    const issues=[];
     if(!passage||passage.id!==module.passageId||typeof passage.title!=='string'||!passage.title.trim()||typeof passage.text!=='string'||wordCount(passage.text)<650||wordCount(passage.text)>900)issues.push(`passage_content_or_length:${passage?wordCount(passage.text):0}`);
-    if(!validQuestionSet(value?.questions,module.firstNumber,module.count)||value.questions.some(question=>question.passageId!==module.passageId||typeof question.evidence!=='string'||!question.evidence.trim()))issues.push(`question_count_or_evidence:${Array.isArray(value?.questions)?value.questions.length:0}`);
+    return issues;
+  }
+  if(module.kind==='reading-questions'){
+    const issues=[];
+    if(!validQuestionSet(value?.questions,module.firstNumber,module.count))issues.push(`question_count_or_format:${Array.isArray(value?.questions)?value.questions.length:0}`);
+    else if(value.questions.some(question=>question.passageId!==module.passageId||typeof question.evidence!=='string'||!question.evidence.trim()))issues.push('question_link_or_evidence');
     return issues;
   }
   const writing=value?.writing;
@@ -521,7 +528,7 @@ module.exports = async function handler(req, res) {
       const passageId=`P${index+1}`,count=readingCounts[index],firstNumber=firstReadingQuestion;
       firstReadingQuestion+=count;
       const passageInstruction=index===0?'Use a concrete science, environment, or design topic.':index===1?'Use a distinct topic in history, society, or education.':'Use a distinct topic in policy, technology, or research.';
-      modules.push({name:`reading_${passageId}`,kind:'reading',passageId,firstNumber,count,maxOutputTokens:8500,system:`${readingPassagePrompt} ${passageInstruction}`,user:JSON.stringify({module:{kind:'reading',passageId,firstNumber,count},...input})});
+      modules.push({name:`reading_${passageId}`,kind:'reading',passageId,maxOutputTokens:4000,system:`${readingPassagePrompt} ${passageInstruction}`,user:JSON.stringify({module:{kind:'reading',passageId},...input})});
     }
     modules.push({name:'writing_speaking',kind:'writing-speaking',maxOutputTokens:6500,system:writingSpeakingPrompt,user:JSON.stringify({module:{kind:'writing-speaking'},...input})});
 
@@ -530,15 +537,23 @@ module.exports = async function handler(req, res) {
         system:issues.length?`${module.system} A previous response for this module failed these checks: ${issues.join(', ')}. Regenerate this module and satisfy them exactly.`:module.system,
         user:module.user,
         maxOutputTokens:module.maxOutputTokens,
-        timeoutMs:retry?90000:150000
+        timeoutMs:retry?45000:90000
       },config,true);
       try{
         let generated=await run([]);
-        if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+        let retried=false;
+        if(generated?.handled){
+          const code=generated.failure?.body?.code;
+          if(!['AI_INVALID_RESPONSE','AI_INCOMPLETE_RESPONSE'].includes(code))return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+          generated=await run([`response_format:${code}`],true);
+          retried=true;
+          if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+        }
         let issues=moduleIssues(module,generated);
-        if(issues.length){
+        if(issues.length&&!retried){
           console.warn('Generated IELTS module failed structure checks',JSON.stringify({module:module.name,issues}));
           generated=await run(issues,true);
+          retried=true;
           if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
           issues=moduleIssues(module,generated);
         }
@@ -548,21 +563,37 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    const generatedModules=await Promise.all(modules.map(generateModule));
-    const failedModule=generatedModules.find(item=>item.failure);
-    const invalidModule=generatedModules.find(item=>item.issues);
-    if(failedModule||invalidModule){
+    async function finishFailedModules(generatedModules) {
+      const failedModule=generatedModules.find(item=>item.failure);
+      const invalidModule=generatedModules.find(item=>item.issues);
+      if(!failedModule&&!invalidModule)return null;
       if(invalidModule)console.warn('IELTS module retry failed structure checks',JSON.stringify({module:invalidModule.module,issues:invalidModule.issues}));
       const released=await generationReservation(req,'release',reservation);
-      if(released!==true)return reply(res,503,{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'});
-      if(failedModule)return reply(res,failedModule.failure.status,failedModule.failure.body);
-      return reply(res,502,{error:'部分题目模块经过修复后仍不完整，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'});
+      if(released!==true)return {status:503,body:{error:'生成没有完成，暂时无法确认名额已释放；请稍后再试。',code:'GENERATION_QUOTA_RELEASE_FAILED'}};
+      if(failedModule)return failedModule.failure;
+      return {status:502,body:{error:'部分题目模块经过修复后仍不完整，今日名额已释放，可以稍后重试。',code:'AI_PAPER_STRUCTURE_INVALID'}};
     }
-    const values=generatedModules.map(item=>item.value);
+    const firstModules=await Promise.all(modules.map(generateModule));
+    const firstFailure=await finishFailedModules(firstModules);
+    if(firstFailure)return reply(res,firstFailure.status,firstFailure.body);
+    const firstValues=firstModules.map(item=>item.value);
+    const passages=firstValues.slice(4,7).map(item=>item.passage);
+    const questionCounts=[13,13,14];
+    let firstNumber=1;
+    const questionModules=passages.map((passage,index)=>{
+      const count=questionCounts[index];
+      const module={name:`reading_questions_${passage.id}`,kind:'reading-questions',passageId:passage.id,firstNumber,count,maxOutputTokens:7000,system:readingQuestionsPrompt,user:JSON.stringify({module:{kind:'reading-questions',passageId:passage.id,firstNumber,count},passage,...input})};
+      firstNumber+=count;
+      return module;
+    });
+    const generatedQuestions=await Promise.all(questionModules.map(generateModule));
+    const questionFailure=await finishFailedModules(generatedQuestions);
+    if(questionFailure)return reply(res,questionFailure.status,questionFailure.body);
+    const values=generatedQuestions.map(item=>item.value);
     const result={
-      listening:{parts:values.slice(0,4)},
-      reading:{passages:values.slice(4,7).map(item=>item.passage),questions:values.slice(4,7).flatMap(item=>item.questions)},
-      ...values[7]
+      listening:{parts:firstValues.slice(0,4)},
+      reading:{passages,questions:values.flatMap(item=>item.questions)},
+      ...firstValues[7]
     };
     const issues=paperStructureIssues(result);
     if(issues.length){
