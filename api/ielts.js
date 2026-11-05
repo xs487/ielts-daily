@@ -275,6 +275,10 @@ function answerLength(prompt) {
   return match?({one:1,two:2,three:3}[match[1].toLowerCase()]||Number(match[1])):3;
 }
 
+function isPhoneAnswer(prompt, answer) {
+  return /\b(?:phone|telephone|mobile|contact\s+number)\b/i.test(prompt)&&/^\+?[\d ()-]+$/.test(answer)&&/^[\d]{7,15}$/.test(answer.replace(/\D/g,''));
+}
+
 function answerLengthIssues(questions) {
   const issues=[];
   for(const question of questions||[]){
@@ -284,9 +288,13 @@ function answerLengthIssues(questions) {
     const answers=[question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])];
     for(const answer of answers){
       if(typeof answer!=='string'||!answer.trim())continue;
-      const words=answer.trim().split(/\s+/);
-      const numbers=allowsNumber?words.filter(word=>/^\d+(?:[.,:]\d+)*$/.test(word)).length:0;
-      if(words.length-numbers>limit||numbers>1){
+      const words=isPhoneAnswer(question.prompt,answer.trim())?[answer.trim()]:answer.trim().split(/\s+/);
+      const numbers=allowsNumber?(isPhoneAnswer(question.prompt,answer.trim())?1:words.filter(word=>/^\d+(?:[.,:]\d+)*$/.test(word)).length):0;
+      if(numbers>1){
+        issues.push(`answer_exceeds_number_limit:q${question.number}:${numbers}_numbers;maximum_1`);
+        break;
+      }
+      if(words.length-numbers>limit){
         issues.push(`answer_exceeds_word_limit:q${question.number}:${words.length-numbers}_words;maximum_${limit}`);
         break;
       }
@@ -335,6 +343,9 @@ function normalizeGeneratedQuestions(module, value) {
   alignAnswerWordLimits(questions,module.kind==='listening-questions'?'listening':'reading');
   for(const question of questions){
     if(!question||typeof question!=='object')continue;
+    if(question.format==='text'&&Array.isArray(question.acceptedAnswers)){
+      question.acceptedAnswers=question.acceptedAnswers.filter(answer=>typeof answer!=='string'||!answer.trim()||!answerLengthIssues([{...question,answer,acceptedAnswers:[]}]).length);
+    }
     const wrong=question.format==='choice'&&Array.isArray(question.options)?question.options.filter(option=>option!==question.answer):[];
     const seen=new Set();
     question.distractorNotes=(Array.isArray(question.distractorNotes)?question.distractorNotes:[]).filter(note=>{
@@ -737,9 +748,10 @@ module.exports = async function handler(req, res) {
     modules.push({name:'writing_speaking',kind:'writing-speaking',maxOutputTokens:6500,system:writingSpeakingPrompt,user:JSON.stringify({module:{kind:'writing-speaking'},...input})});
 
     async function generateModule(module) {
+      let previousDraft;
       const run=async(issues,retry=false)=>openAI(req,res,{
-        system:issues.length?`${module.system} A previous response for this module failed these checks: ${issues.join(', ')}. Regenerate this module and satisfy them exactly.`:module.system,
-        user:module.user,
+        system:issues.length?`${module.system} A previous response for this module failed these checks: ${issues.join(', ')}. If previousDraft is supplied, revise the specific faulty items, retaining sound material; otherwise regenerate. Return the COMPLETE module in the original schema, not a patch. A number-limit error means more than one numeric value was supplied: choose one fact, not a list or range.`:module.system,
+        user:previousDraft?JSON.stringify({...JSON.parse(module.user),previousDraft,validationIssues:issues}):module.user,
         maxOutputTokens:module.maxOutputTokens,
         timeoutMs:retry?45000:90000
       },config,true);
@@ -757,6 +769,7 @@ module.exports = async function handler(req, res) {
         let issues=moduleIssues(module,generated);
         if(issues.length&&!retried){
           console.warn('Generated IELTS module failed structure checks',JSON.stringify({module:module.name,issues}));
+          previousDraft=generated;
           generated=await run(issues,true);
           retried=true;
           if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};

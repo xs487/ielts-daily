@@ -467,11 +467,13 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
     const limit=/\b(?:no more than\s+)?(one|two|three|[1-3])\s+words?(?:\s+only)?(?:\s+(and\/or|and|or)\s+(?:a|one|1)\s+number)?\b/i.exec(String(prompt||''));
     if(!limit)return true;
     const maxWords={one:1,two:2,three:3}[limit[1].toLowerCase()]||Number(limit[1]);
-    const tokens=normalize(value).split(/\s+/).filter(Boolean),clause=limit[2]?.toLowerCase();
+    const raw=String(value??'').trim();
+    const phone=/\b(?:phone|telephone|mobile|contact\s+number)\b/i.test(String(prompt||''))&&/^\+?[\d ()-]+$/.test(raw)&&/^\d{7,15}$/.test(raw.replace(/\D/g,''));
+    const tokens=phone?[raw]:normalize(value).split(/\s+/).filter(Boolean),clause=limit[2]?.toLowerCase();
     if(!clause)return tokens.length<=maxWords;
     // Keep currency signs and units as written tokens. A written date's day and
     // year are two numbers, even when date equivalence would otherwise match.
-    const numbers=tokens.filter(token=>/^[+-]?\d+(?:[.,:]\d+)*(?:st|nd|rd|th)?[,]?$/.test(token)).length;
+    const numbers=phone?1:tokens.filter(token=>/^[+-]?\d+(?:[.,:]\d+)*(?:st|nd|rd|th)?[,]?$/.test(token)).length;
     const words=tokens.length-numbers;
     return clause==='or'?(numbers===0&&words<=maxWords)||(numbers===1&&words===0):numbers<=1&&words<=maxWords;
   }

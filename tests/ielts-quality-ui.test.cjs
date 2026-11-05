@@ -156,6 +156,31 @@ test('text marking enforces stated word and number limits before equivalent date
   ]);
 });
 
+test('grouped phone numbers count as one number only for explicit phone questions',async()=>{
+  const instruction='Write NO MORE THAN THREE WORDS AND/OR A NUMBER.';
+  await checkAnswerCases([
+    ['01632 960422','01632 960422',true,[], `Phone number: ${instruction}`],
+    ['+44 (1632) 960-422','+44 (1632) 960-422',true,[], `Telephone: ${instruction}`],
+    ['07700 900 412','07700 900 412',true,[], `Mobile: ${instruction}`],
+    ['123 4567','123 4567',true,[], `Contact number: ${instruction}`],
+    ['12345 67890 12345','12345 67890 12345',true,[], `Phone number: ${instruction}`],
+    ['01632 960422','01632 960422',true,[], 'Phone number: Write ONE WORD OR A NUMBER.'],
+    ['01632 960422','01632 960422',true,[], 'Phone number: Write ONE WORD ONLY.'],
+    ['123 456','123 456',false,[], `Phone number: ${instruction}`],
+    ['12345 67890 123456','12345 67890 123456',false,[], `Phone number: ${instruction}`],
+    ['01632 960422','01632 960422',false,[], `Room code: ${instruction}`],
+    ['01632 960422','01632 960422',false,[], `Headphones model: ${instruction}`],
+    ['room 24 25','room 24 25',false,[], `Room details: ${instruction}`],
+    ['01 02','01 02',false,[], `Phone appointment date: ${instruction}`],
+    ['01632 960422 ext 7','01632 960422 ext 7',false,[], `Phone number: ${instruction}`],
+    ['01632 +960422','01632 +960422',false,[], `Phone number: ${instruction}`],
+    ['01632 960422','01632960422',false,[], `Phone number: ${instruction}`],
+    ['01632 960422','(01632) 960422',false,[], `Phone number: ${instruction}`],
+    ['01632 960422','the main office number',false,['the main office number'], `Phone number: ${instruction}`],
+    ['01632 960422','01632 960422 ext 7',false,['01632 960422 ext 7'], `Phone number: ${instruction}`]
+  ]);
+});
+
 test('old papers with malformed accepted variants remain usable and blanks are never correct',async()=>{
   const paper=makePaper();
   paper.listening.parts[0].questions=[

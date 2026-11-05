@@ -522,6 +522,7 @@ for (const [kind, reading] of [['reading-questions', true], ['listening-question
     ['empty explanation', value => { value.questions[0].explanation = ' '; }],
     ['unknown skill', value => { value.questions[0].skill = 'invented_skill'; }],
     ['non-array answer alternatives', value => { value.questions[0].acceptedAnswers = {answer: 'car park'}; }],
+    ['non-string answer alternative', value => { value.questions[0].acceptedAnswers = [24]; }],
     ['empty answer alternative', value => { value.questions[0].acceptedAnswers = ['']; }],
     ['duplicate choice options', value => { makeChoice(value.questions[0], reading); value.questions[0].options[1] = value.questions[0].options[0]; }],
     ['wrong choice option count', value => { makeChoice(value.questions[0], reading); value.questions[0].options.pop(); }],
@@ -989,14 +990,31 @@ for (const moduleCase of [
     }
   });
 
-  for (const invalidVariant of ['answer', 'acceptedAnswers', 'multiple-numbers']) {
+  test(`${moduleCase.kind} filters only over-limit optional variants without regenerating or changing the answer`, async () => {
+    const value = questionModule();
+    Object.assign(value.questions.at(-1), {
+      prompt: 'Write NO MORE THAN THREE WORDS AND A NUMBER. Name the venue.',
+      answer: 'city library',
+      acceptedAnswers: ['central city library', 'the main city library', 'library 24 25', 'city library']
+    });
+    const h = deepseekHarness({deepseekModuleOverrides: {[moduleCase.key]: [{value}]}});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.deepseekModuleCalls.length, 15);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === moduleCase.key).map(call => call.attempt), [1]);
+    const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
+      : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
+    assert.equal(returned.at(-1).answer, 'city library');
+    assert.deepEqual(Array.from(returned.at(-1).acceptedAnswers), ['central city library', 'city library']);
+    assert.equal(returned.at(-1).evidence, value.questions.at(-1).evidence);
+  });
+
+  for (const invalidVariant of ['answer', 'multiple-numbers']) {
     function invalidQuestions() {
       const value = questionModule();
       const invalid = invalidVariant === 'answer'
         ? {prompt: 'ONE WORD ONLY. Where can visitors leave their cars?', answer: 'the main car park', acceptedAnswers: []}
-        : invalidVariant === 'acceptedAnswers'
-          ? {prompt: 'Write NO MORE THAN TWO WORDS. Where can visitors leave their cars?', answer: 'car park', acceptedAnswers: ['the main car park']}
-          : {prompt: 'Write NO MORE THAN TWO WORDS AND A NUMBER. Where is the event?', answer: 'room 24 25', acceptedAnswers: []};
+        : {prompt: 'Write NO MORE THAN TWO WORDS AND A NUMBER. Where is the event?', answer: 'room 24 25', acceptedAnswers: []};
       Object.assign(value.questions.at(-1), invalid);
       return value;
     }
@@ -1017,7 +1035,20 @@ for (const moduleCase of [
           return module.kind === moduleCase.kind && (moduleCase.part ? module.part === moduleCase.part : module.passageId === moduleCase.passageId);
         });
       assert.equal(requests.length, 2);
-      assert.ok(requests[1].messages[0].content.includes(`answer_exceeds_word_limit:q${moduleCase.firstNumber+moduleCase.count-1}:`));
+      const expectedIssue = invalidVariant === 'multiple-numbers'
+        ? `answer_exceeds_number_limit:q${moduleCase.firstNumber+moduleCase.count-1}:2_numbers;maximum_1`
+        : `answer_exceeds_word_limit:q${moduleCase.firstNumber+moduleCase.count-1}:4_words;maximum_${moduleCase.part ? 3 : 1}`;
+      assert.ok(requests[1].messages[0].content.includes(expectedIssue));
+      const firstPayload = JSON.parse(requests[0].messages.find(message => message.role === 'user').content);
+      const retryPayload = JSON.parse(requests[1].messages.find(message => message.role === 'user').content);
+      const {previousDraft, validationIssues, ...originalFields} = retryPayload;
+      assert.deepEqual(originalFields, firstPayload);
+      assert.ok(validationIssues.includes(expectedIssue));
+      if (invalidVariant === 'multiple-numbers') assert.equal(validationIssues.some(issue => issue.startsWith('answer_exceeds_word_limit:')), false);
+      assert.equal(previousDraft.questions.length, moduleCase.count);
+      assert.equal(previousDraft.questions.at(-1).answer, invalidQuestions().questions.at(-1).answer);
+      assert.equal(previousDraft.questions.at(-1).evidence, invalidQuestions().questions.at(-1).evidence);
+      assert.equal(firstPayload.previousDraft, undefined);
       const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
         : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
       assert.equal(returned.at(-1).prompt, moduleCase.part
@@ -1073,6 +1104,86 @@ for (const moduleCase of [
         : expectedPrompt);
       assert.equal(returned.at(-1).answer, question.answer);
       assert.deepEqual(Array.from(returned.at(-1).acceptedAnswers), question.acceptedAnswers);
+    }
+  });
+
+  function numberQuestionOverrides(label, answer) {
+    const value = questionModule();
+    const evidence = `The final contact detail is ${answer}.`;
+    Object.assign(value.questions.at(-1), {
+      prompt: `Write ONE WORD AND A NUMBER. Record the ${label}: ____.`,
+      answer, acceptedAnswers: [], evidence, skill: 'number'
+    });
+    if (moduleCase.part) {
+      const source = makeDeepSeekModule({kind: 'listening-script', part: moduleCase.part});
+      source.script += ` ${evidence}`;
+      return {value, source, overrides: {
+        [`listening-script-${moduleCase.part}`]: [{value: source}],
+        [moduleCase.key]: [{value}]
+      }};
+    }
+    const source = makeDeepSeekModule({kind: 'reading', passageId: moduleCase.passageId});
+    source.passage.text += ` ${evidence}`;
+    return {value, source, overrides: {
+      [`reading-${moduleCase.passageId}`]: [{value: source}],
+      [moduleCase.key]: [{value}]
+    }};
+  }
+
+  test(`${moduleCase.kind} accepts one contextual telephone number without rewriting its source or answer`, async () => {
+    for (const [label, answer] of [
+      ['phone number', '01632 960422'],
+      ['telephone number', '(01632) 960422'],
+      ['mobile number', '07700 900123'],
+      ['contact number', '01632-960422']
+    ]) {
+      const {value, source, overrides} = numberQuestionOverrides(label, answer);
+      const h = deepseekHarness({deepseekModuleOverrides: overrides});
+      const result = await h.invoke({action: 'generate', words: vocab});
+      assert.equal(result.statusCode, 200, `${label}: ${answer}`);
+      assert.equal(h.deepseekModuleCalls.length, 15);
+      const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
+        : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
+      assert.equal(returned.at(-1).answer, answer);
+      assert.equal(returned.at(-1).evidence, value.questions.at(-1).evidence);
+      if (moduleCase.part) assert.equal(result.body.paper.listening.parts[moduleCase.part - 1].script, source.script);
+      else assert.equal(result.body.paper.reading.passages.find(passage => passage.id === moduleCase.passageId).text, source.passage.text);
+    }
+  });
+
+  test(`${moduleCase.kind} does not let telephone formatting bypass answer grounding`, async () => {
+    const {value, overrides} = numberQuestionOverrides('phone number', '01632 960422');
+    value.questions.at(-1).answer = '01632 960423';
+    const h = deepseekHarness({deepseekModuleOverrides: overrides});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.deepseekModuleCalls.length, 16);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === moduleCase.key).map(call => call.attempt), [1, 2]);
+    const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
+      : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
+    assert.equal(returned.some(question => question.answer === '01632 960423'), false);
+  });
+
+  test(`${moduleCase.kind} diagnoses two numbers accurately when the telephone exception does not apply`, async () => {
+    for (const [label, answer] of [
+      ['reference number', '01632 960422'],
+      ['contact number', '24 25'],
+      ['phone number', '12345678 12345678']
+    ]) {
+      const {value, overrides} = numberQuestionOverrides(label, answer);
+      const h = deepseekHarness({deepseekModuleOverrides: overrides});
+      const result = await h.invoke({action: 'generate', words: vocab});
+      assert.equal(result.statusCode, 200, `${label}: ${answer}`);
+      assert.equal(h.deepseekModuleCalls.length, 16);
+      const requests = h.calls.filter(call => call.url === 'https://api.deepseek.com/chat/completions')
+        .map(call => JSON.parse(JSON.parse(call.options.body).messages.find(message => message.role === 'user').content))
+        .filter(payload => payload.module.kind === moduleCase.kind && (moduleCase.part ? payload.module.part === moduleCase.part : payload.module.passageId === moduleCase.passageId));
+      assert.equal(requests.length, 2);
+      const expectedIssue = `answer_exceeds_number_limit:q${moduleCase.firstNumber+moduleCase.count-1}:2_numbers;maximum_1`;
+      assert.ok(requests[1].validationIssues.includes(expectedIssue));
+      assert.equal(requests[1].validationIssues.some(issue => issue.startsWith('answer_exceeds_word_limit:')), false);
+      assert.equal(requests[1].previousDraft.questions.at(-1).answer, answer);
+      assert.equal(requests[1].previousDraft.questions.at(-1).evidence, value.questions.at(-1).evidence);
     }
   });
 }
