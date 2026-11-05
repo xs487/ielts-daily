@@ -524,7 +524,6 @@ for (const [kind, reading] of [['reading-questions', true], ['listening-question
     ['empty answer alternative', value => { value.questions[0].acceptedAnswers = ['']; }],
     ['duplicate choice options', value => { makeChoice(value.questions[0], reading); value.questions[0].options[1] = value.questions[0].options[0]; }],
     ['wrong choice option count', value => { makeChoice(value.questions[0], reading); value.questions[0].options.pop(); }],
-    ['missing distractor reasoning', value => { makeChoice(value.questions[0], reading); value.questions[0].distractorNotes.pop(); }],
     ['choice accepting a wrong alternative', value => { makeChoice(value.questions[0], reading); value.questions[0].acceptedAnswers = ['railway station']; }],
     ['unsupported evidence status', value => { value.questions[0].evidenceStatus = 'contradicted'; }]
   ]) {
@@ -540,6 +539,29 @@ for (const [kind, reading] of [['reading-questions', true], ['listening-question
       assert.equal(h.deepseekModuleCalls.length, 16);
       assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === targetKey).map(call => call.attempt), [1, 2]);
       assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'commit']);
+    });
+  }
+
+  for (const [name, notes, expected] of [
+    ['omitted', undefined, []],
+    ['non-array', {option: 'unavailable alternative', reason: 'Not the stated location.'}, []],
+    ['partially missing', [{option: 'unavailable alternative', reason: 'Not the stated location.'}], [{option: 'unavailable alternative', reason: 'Not the stated location.'}]],
+    ['malformed and duplicate', [null, 'invalid', {}, {option: 'car park', reason: 'This is the correct answer.'}, {option: 'invented option', reason: 'Unknown option.'}, {option: 'rejected alternative', reason: ' '}, {option: 'unavailable alternative', reason: 'Not the stated location.'}, {option: 'unavailable alternative', reason: 'Duplicate reason.'}], [{option: 'unavailable alternative', reason: 'Not the stated location.'}]]
+  ]) {
+    test(`${kind} accepts ${name} distractor reasons and retains only valid unique notes`, async () => {
+      const value = qualityModule(kind, 2);
+      const target = value.questions[reading ? 5 : 0];
+      makeChoice(target, reading);
+      target.distractorNotes = notes;
+      const targetKey = reading ? key : 'listening-questions-2';
+      const h = deepseekHarness({deepseekModuleOverrides: {[targetKey]: [{value}]}});
+      const result = await h.invoke({action: 'generate', words: vocab});
+      assert.equal(result.statusCode, 200);
+      assert.equal(h.deepseekModuleCalls.length, 15);
+      assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === targetKey).map(call => call.attempt), [1]);
+      const returned = reading ? result.body.paper.reading.questions[5] : result.body.paper.listening.parts[1].questions[0];
+      assert.deepEqual(JSON.parse(JSON.stringify(returned.distractorNotes)), expected);
+      assert.equal(returned.explanation, target.explanation);
     });
   }
 
@@ -583,26 +605,88 @@ for (const [name, mutate] of [
   });
 }
 
-test('listening repairs questions whose evidence runs backwards through the script', async () => {
+test('listening sorts grounded questions by evidence and renumbers without regenerating', async () => {
   const value = qualityModule('listening-questions');
-  const first = value.questions[0], second = value.questions[1];
-  [first.answer, second.answer] = [second.answer, first.answer];
-  [first.evidence, second.evidence] = [second.evidence, first.evidence];
+  value.questions.reverse();
+  value.questions.forEach((question, index) => { question.number = index + 1; });
   const h = deepseekHarness({deepseekModuleOverrides: {'listening-questions-1': [{value}]}});
   const result = await h.invoke({action: 'generate', words: vocab});
   assert.equal(result.statusCode, 200);
-  assert.equal(h.deepseekModuleCalls.length, 16);
+  assert.equal(h.deepseekModuleCalls.length, 15);
+  assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === 'listening-questions-1').map(call => call.attempt), [1]);
+  const questions = result.body.paper.listening.parts[0].questions;
+  assert.deepEqual(Array.from(questions, question => question.number), Array.from({length: 10}, (_, index) => index + 1));
+  assert.deepEqual(Array.from(questions, question => question.answer), fixtureFacts.slice(0, 10).map(([answer]) => answer));
+  assert.match(questions[0].prompt, /stop 1/);
+  assert.match(questions[9].prompt, /stop 10/);
 });
 
-test('reading repairs an undersized passage before writing its questions', async () => {
+test('listening allows mixed question formats in script order and keeps equal evidence stable', async () => {
+  const value = qualityModule('listening-questions', 2);
+  value.questions[0] = fixtureQuestion(11, 0);
+  value.questions[4].evidence = value.questions[3].evidence;
+  value.questions[4].answer = value.questions[3].answer;
+  makeChoice(value.questions[4], false);
+  const originals = value.questions.map(question => ({prompt: question.prompt, answer: question.answer, format: question.format}));
+  value.questions = [value.questions[9], ...value.questions.slice(0, 9)];
+  value.questions.forEach((question, index) => { question.number = 11 + index; });
+  const h = deepseekHarness({deepseekModuleOverrides: {'listening-questions-2': [{value}]}});
+  const result = await h.invoke({action: 'generate', words: vocab});
+  assert.equal(result.statusCode, 200);
+  assert.equal(h.deepseekModuleCalls.length, 15);
+  const returned = result.body.paper.listening.parts[1].questions;
+  assert.deepEqual(Array.from(returned, question => question.number), Array.from({length: 10}, (_, index) => 11 + index));
+  assert.deepEqual(Array.from(returned, question => question.format), originals.map(question => question.format));
+  assert.deepEqual(Array.from(returned, question => question.answer), originals.map(question => question.answer));
+  assert.equal(returned[3].prompt, originals[3].prompt);
+  assert.equal(returned[4].prompt, originals[4].prompt);
+});
+
+test('reading repairs a passage below 700 words before writing its questions', async () => {
   const value = makeDeepSeekModule({kind: 'reading', passageId: 'P1'});
-  value.passage.text = value.passage.text.split(/\s+/).slice(0, 700).join(' ');
+  value.passage.text = value.passage.text.split(/\s+/).slice(0, 699).join(' ');
   const h = deepseekHarness({deepseekModuleOverrides: {'reading-P1': [{value}]}});
   const result = await h.invoke({action: 'generate', words: vocab});
   assert.equal(result.statusCode, 200);
   assert.equal(h.deepseekModuleCalls.length, 16);
   assert.equal(h.deepseekModuleCalls.find(call => call.key === 'reading-questions-P1').passage.words, 750);
 });
+
+function resizedReadingPassage(id, words) {
+  const passage = makeDeepSeekModule({kind: 'reading', passageId: id}).passage;
+  const tokens = passage.text.split(/\s+/);
+  const filler = 'Independent observers recorded additional measurements across the route'.split(' ');
+  while (tokens.length < words) tokens.push(filler[tokens.length % filler.length]);
+  passage.text = tokens.slice(0, words).join(' ');
+  return passage;
+}
+
+for (const words of [700, 924, 1000]) {
+  test(`reading accepts an original ${words}-word passage when the total remains in range`, async () => {
+    const passage = resizedReadingPassage('P1', words);
+    const h = deepseekHarness({deepseekModuleOverrides: {'reading-P1': [{value: {passage}}]}});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.deepseekModuleCalls.length, 15);
+    assert.equal(result.body.paper.reading.passages[0].text.trim().split(/\s+/).length, words);
+    assert.equal(result.body.paper.reading.passages.reduce((sum, item) => sum + item.text.trim().split(/\s+/).length, 0), words + 1500);
+  });
+}
+
+for (const words of [700, 1000]) {
+  test(`reading rejects a ${words * 3}-word total despite individually valid passages`, async () => {
+    const overrides = Object.fromEntries(['P1', 'P2', 'P3'].map(id => [`reading-${id}`, [{value: {passage: resizedReadingPassage(id, words)}}]]));
+    const h = deepseekHarness({deepseekModuleOverrides: overrides});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 502);
+    assert.equal(result.body.code, 'AI_PAPER_STRUCTURE_INVALID');
+    assert.equal(result.body.paper, undefined);
+    assert.equal(h.deepseekModuleCalls.length, 8);
+    assert.equal(h.deepseekModuleCalls.some(call => call.key.includes('-questions-')), false);
+    assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'release']);
+    assert.equal(h.reservationState.has(h.reservationCalls[0].usedKey), false);
+  });
+}
 
 test('Task 1 grading sends validated original chart data to the model', async () => {
   const chart = makePaper().writing.task1.chart;
@@ -814,7 +898,9 @@ for (const moduleCase of [
     assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === moduleCase.key).map(call => call.attempt), [1]);
     const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
       : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
-      assert.equal(returned.at(-1).prompt, expected);
+      assert.equal(returned.at(-1).prompt, moduleCase.part
+        ? expected.replace(/Write NO MORE THAN (?:TWO|THREE) WORDS(?: AND A NUMBER)?/, 'Write NO MORE THAN THREE WORDS AND/OR A NUMBER')
+        : expected);
       assert.equal(returned.at(-1).answer, question.answer);
       assert.deepEqual(Array.from(returned.at(-1).acceptedAnswers), question.acceptedAnswers);
     }
@@ -851,7 +937,9 @@ for (const moduleCase of [
       assert.ok(requests[1].messages[0].content.includes(`answer_exceeds_word_limit:q${moduleCase.firstNumber+moduleCase.count-1}:`));
       const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
         : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
-      assert.equal(returned.at(-1).prompt, 'Write NO MORE THAN TWO WORDS. Where can visitors leave their cars?');
+      assert.equal(returned.at(-1).prompt, moduleCase.part
+        ? 'Write NO MORE THAN THREE WORDS AND/OR A NUMBER. Where can visitors leave their cars?'
+        : 'Write NO MORE THAN TWO WORDS. Where can visitors leave their cars?');
       assert.equal(returned.at(-1).answer, 'car park');
       assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'commit']);
     });
@@ -896,7 +984,10 @@ for (const moduleCase of [
     assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === moduleCase.key).map(call => call.attempt), [1]);
     const returned = moduleCase.part ? result.body.paper.listening.parts[moduleCase.part - 1].questions
       : result.body.paper.reading.questions.filter(question => question.passageId === moduleCase.passageId);
-      assert.equal(returned.at(-1).prompt, index === 5 ? 'Name the second venue. (Write NO MORE THAN THREE WORDS).' : question.prompt);
+      const expectedPrompt = index === 5 ? 'Name the second venue. (Write NO MORE THAN THREE WORDS).' : question.prompt;
+      assert.equal(returned.at(-1).prompt, moduleCase.part
+        ? expectedPrompt.replace(/(?:Write )?(?:NO MORE THAN )?(?:ONE|TWO|THREE) WORDS?(?: ONLY)?(?: AND\/OR A NUMBER| AND A NUMBER| OR A NUMBER)?/i, 'Write NO MORE THAN THREE WORDS AND/OR A NUMBER')
+        : expectedPrompt);
       assert.equal(returned.at(-1).answer, question.answer);
       assert.deepEqual(Array.from(returned.at(-1).acceptedAnswers), question.acceptedAnswers);
     }
