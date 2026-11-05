@@ -729,16 +729,6 @@ for (const [kind, reading] of [['reading-questions', true], ['listening-question
   });
 }
 
-test('reading repairs a passage below 700 words before writing its questions', async () => {
-  const value = makeDeepSeekModule({kind: 'reading', passageId: 'P1'});
-  value.passage.text = value.passage.text.split(/\s+/).slice(0, 699).join(' ');
-  const h = deepseekHarness({deepseekModuleOverrides: {'reading-P1': [{value}]}});
-  const result = await h.invoke({action: 'generate', words: vocab});
-  assert.equal(result.statusCode, 200);
-  assert.equal(h.deepseekModuleCalls.length, 16);
-  assert.equal(h.deepseekModuleCalls.find(call => call.key === 'reading-questions-P1').passage.words, 750);
-});
-
 function resizedReadingPassage(id, words) {
   const passage = makeDeepSeekModule({kind: 'reading', passageId: id}).passage;
   const tokens = passage.text.split(/\s+/);
@@ -748,19 +738,40 @@ function resizedReadingPassage(id, words) {
   return passage;
 }
 
-for (const words of [700, 924, 1000]) {
-  test(`reading accepts an original ${words}-word passage when the total remains in range`, async () => {
+for (const words of [599, 1051]) {
+  test(`reading repairs a ${words}-word passage before writing its questions`, async () => {
     const passage = resizedReadingPassage('P1', words);
     const h = deepseekHarness({deepseekModuleOverrides: {'reading-P1': [{value: {passage}}]}});
     const result = await h.invoke({action: 'generate', words: vocab});
     assert.equal(result.statusCode, 200);
-    assert.equal(h.deepseekModuleCalls.length, 15);
-    assert.equal(result.body.paper.reading.passages[0].text.trim().split(/\s+/).length, words);
-    assert.equal(result.body.paper.reading.passages.reduce((sum, item) => sum + item.text.trim().split(/\s+/).length, 0), words + 1500);
+    assert.equal(h.deepseekModuleCalls.length, 16);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === 'reading-P1').map(call => call.attempt), [1, 2]);
+    assert.equal(h.deepseekModuleCalls.find(call => call.key === 'reading-questions-P1').passage.words, 750);
   });
 }
 
-for (const words of [700, 1000]) {
+for (const words of [600, 647, 700, 924, 1000, 1050]) {
+  test(`reading accepts an original ${words}-word passage when the total remains in range`, async () => {
+    const passage = resizedReadingPassage('P1', words);
+    const otherWords = words < 650 ? 800 : 750;
+    const overrides = {
+      'reading-P1': [{value: {passage}}],
+      ...(otherWords === 800 ? {
+        'reading-P2': [{value: {passage: resizedReadingPassage('P2', otherWords)}}],
+        'reading-P3': [{value: {passage: resizedReadingPassage('P3', otherWords)}}]
+      } : {})
+    };
+    const h = deepseekHarness({deepseekModuleOverrides: overrides});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.deepseekModuleCalls.length, 15);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === 'reading-P1').map(call => call.attempt), [1]);
+    assert.equal(result.body.paper.reading.passages[0].text.trim().split(/\s+/).length, words);
+    assert.equal(result.body.paper.reading.passages.reduce((sum, item) => sum + item.text.trim().split(/\s+/).length, 0), words + otherWords * 2);
+  });
+}
+
+for (const words of [600, 1050]) {
   test(`reading rejects a ${words * 3}-word total despite individually valid passages`, async () => {
     const overrides = Object.fromEntries(['P1', 'P2', 'P3'].map(id => [`reading-${id}`, [{value: {passage: resizedReadingPassage(id, words)}}]]));
     const h = deepseekHarness({deepseekModuleOverrides: overrides});
