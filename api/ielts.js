@@ -8,7 +8,7 @@ const listeningQuestionsPrompt = `${practiceBase} Create exactly 10 IELTS Listen
 
 const readingPassagePrompt = `${practiceBase} Create one original IELTS Academic reading passage. Output exactly this shape: {"passage":{"id":"P1","title":"","text":""}}. Passage text must contain 650-900 words. Use the supplied passage ID. Develop a coherent academic argument or explanation with enough specific evidence for a separate reading question set. Return the passage only.`;
 
-const readingQuestionsPrompt = `${practiceBase} Create IELTS Academic reading questions for the supplied passage. Output exactly this shape: {"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]}. Create exactly the requested question count and number range, all linked to the supplied passage ID. Use a mix of TRUE/FALSE/NOT GIVEN, multiple choice and short/sentence completion. For choice/tfng include 3 options and make answer exactly one option; provide acceptable variants for text answers. Every item must be answerable from the passage and include a short evidence quote. Do not repeat the passage in the output.`;
+const readingQuestionsPrompt = `${practiceBase} Create IELTS Academic reading questions for the supplied passage. Output exactly this shape: {"questions":[{"number":1,"passageId":"P1","format":"text|choice|tfng","prompt":"","options":[],"answer":"","acceptedAnswers":[],"explanation":"","evidence":""}]}. Create exactly the requested question count and number range, all linked to the supplied passage ID. Use a mix of TRUE/FALSE/NOT GIVEN, multiple choice and short/sentence completion. For choice/tfng include 3 options and make answer exactly one option. For every text question, use a concise answer of at most THREE words, state a clear word limit, and ensure every acceptedAnswers variant also fits that limit. Every item must be answerable from the passage and include a short evidence quote. Do not repeat the passage in the output.`;
 
 const writingSpeakingPrompt = `${practiceBase} Create original IELTS Academic Writing Task 1 and Task 2 prompts plus Speaking Parts 1-3. Output exactly this shape: {"writing":{"task1":{"prompt":"","chart":{"title":"","categories":["","","",""],"series":[{"name":"","values":[1,2,3,4]},{"name":"","values":[4,3,2,1]}]}},"task2":{"prompt":""}},"speaking":{"part1":[""],"part2":{"cueCard":""},"part3":[""]}}. Task 1 must describe a coherent visual with at least four categories and at least two numeric series, and its prompt must match the data. Task 2 must be an answerable discussion or argument prompt. Speaking Part 1 and Part 3 need 4-5 questions each; Part 2 needs a cue card with 3-4 bullets and a final explain question. Part 3 should extend the Part 2 topic into broader analysis.`;
 
@@ -189,12 +189,16 @@ function validQuestions(questions, firstNumber) { return validQuestionSet(questi
 
 function wordCount(value) { return (String(value||'').match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g)||[]).length; }
 
+function answerLength(prompt) {
+  const match=String(prompt||'').match(/\b(one|two|three|[1-3])\s+words?\b/i);
+  return match?({one:1,two:2,three:3}[match[1].toLowerCase()]||Number(match[1])):3;
+}
+
 function answerLengthIssues(questions) {
   const issues=[];
   for(const question of questions||[]){
     if(question.format!=='text')continue;
-    const match=question.prompt.match(/\b(one|two|three|[1-3])\s+words?\b/i);
-    const limit=match?({one:1,two:2,three:3}[match[1].toLowerCase()]||Number(match[1])):3;
+    const limit=answerLength(question.prompt);
     const allowsNumber=/\b(?:and\/or|and|or)\s+(?:a|one|1)\s+number\b/i.test(question.prompt);
     const answers=[question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])];
     for(const answer of answers){
@@ -208,6 +212,33 @@ function answerLengthIssues(questions) {
     }
   }
   return issues;
+}
+
+function alignAnswerWordLimits(questions) {
+  if(!Array.isArray(questions))return;
+  const wordLimitPattern=/\b(?:(?:write|use)\s+)?(?:no more than\s+)?(?:one|two|three|[1-3])\s+words?(?:\s+only)?(?:\s+(?:and\/or|and|or)\s+(?:a|one|1)\s+number)?\b/i;
+  for(const question of questions){
+    if(!question||question.format!=='text'||typeof question.prompt!=='string')continue;
+    const answers=[question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])].filter(answer=>typeof answer==='string'&&answer.trim());
+    if(!answers.length)continue;
+    const allowsNumber=/\b(?:and\/or|and|or)\s+(?:a|one|1)\s+number\b/i.test(question.prompt);
+    const maxWords=Math.max(...answers.map(answer=>{
+      const tokens=answer.trim().split(/\s+/);
+      const numbers=allowsNumber?tokens.filter(word=>/^\d+(?:[.,:]\d+)*$/.test(word)).length:0;
+      return tokens.length-numbers;
+    }));
+    const hasTooManyNumbers=allowsNumber&&answers.some(answer=>answer.trim().split(/\s+/).filter(word=>/^\d+(?:[.,:]\d+)*$/.test(word)).length>1);
+    if(maxWords>3||hasTooManyNumbers)continue;
+    const currentLimit=answerLength(question.prompt);
+    if(maxWords>currentLimit){
+      const instruction=`Write NO MORE THAN ${['ONE','TWO','THREE'][maxWords-1]} WORD${maxWords===1?'':'S'}${allowsNumber?' AND A NUMBER':''}`;
+      question.prompt=wordLimitPattern.test(question.prompt)
+        ? question.prompt.replace(wordLimitPattern,instruction)
+        : `${question.prompt.trim()} (${instruction}).`;
+    }else if(!/\b(?:one|two|three|[1-3])\s+words?\b/i.test(question.prompt)){
+      question.prompt=`${question.prompt.trim()} (Write NO MORE THAN THREE WORDS${allowsNumber?' AND A NUMBER':''}).`;
+    }
+  }
 }
 
 function validReading(reading) {
@@ -583,12 +614,14 @@ module.exports = async function handler(req, res) {
           retried=true;
           if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
         }
+        if(module.kind==='listening-questions'||module.kind==='reading-questions')alignAnswerWordLimits(generated?.questions);
         let issues=moduleIssues(module,generated);
         if(issues.length&&!retried){
           console.warn('Generated IELTS module failed structure checks',JSON.stringify({module:module.name,issues}));
           generated=await run(issues,true);
           retried=true;
           if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+          if(module.kind==='listening-questions'||module.kind==='reading-questions')alignAnswerWordLimits(generated?.questions);
           issues=moduleIssues(module,generated);
         }
         return issues.length?{module:module.name,issues}:{value:generated};
