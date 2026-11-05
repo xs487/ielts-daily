@@ -178,7 +178,7 @@ function makeGradeFixture(overrides = {}) {
   };
 }
 
-function createHarness({redisMode = 'ok', aiStatus = 200, aiStatusSequence = [], paperSequence = [], gradeFeedback = makeGradeFixture(), aiGate, reservationModes = {}, deepseekModuleOverrides = {}, openAIKey = fakeOpenAIKey, provider, envOverrides = {}, wawaMode = 'completed', deepseekMode = 'stop', doubaoMode = 'completed', ttsStatus = 200} = {}) {
+function createHarness({redisMode = 'ok', aiStatus = 200, aiStatusSequence = [], paperSequence = [], gradeFeedback = makeGradeFixture(), aiGate, reservationModes = {}, deepseekModuleOverrides = {}, openAIKey = fakeOpenAIKey, provider, envOverrides = {}, wawaMode = 'completed', deepseekMode = 'stop', doubaoMode = 'completed', ttsStatus = 200, random} = {}) {
   const calls = [];
   const reservationCalls = [];
   const reservationState = new Map();
@@ -214,6 +214,7 @@ function createHarness({redisMode = 'ok', aiStatus = 200, aiStatusSequence = [],
   if (provider !== undefined) env.AI_PROVIDER = provider;
   Object.assign(env, envOverrides);
   const sandbox = {
+    ...(random ? {Math: Object.assign(Object.create(Math), {random})} : {}),
     Buffer,
     TextDecoder,
     AbortSignal,
@@ -641,6 +642,88 @@ test('listening allows mixed question formats in script order and keeps equal ev
   assert.equal(returned[3].prompt, originals[3].prompt);
   assert.equal(returned[4].prompt, originals[4].prompt);
 });
+
+function questionContent(question) {
+  const {number, options, ...content} = question;
+  return JSON.parse(JSON.stringify({...content, ...(options ? {options: [...options].sort()} : {})}));
+}
+
+test('reading sorts reversed choice and completion groups without moving passages or regenerating', async () => {
+  const value = makeDeepSeekModule({kind: 'reading-questions', passageId: 'P2', firstNumber: 14, count: 13});
+  const originals = value.questions.map(questionContent);
+  value.questions = [...value.questions.slice(0, 5), ...value.questions.slice(5, 9).reverse(), ...value.questions.slice(9).reverse()];
+  value.questions.forEach((question, index) => { question.number = 14 + index; });
+  const h = deepseekHarness({deepseekModuleOverrides: {'reading-questions-P2': [{value}]}});
+  const result = await h.invoke({action: 'generate', words: vocab});
+  assert.equal(result.statusCode, 200);
+  assert.equal(h.deepseekModuleCalls.length, 15);
+  assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === 'reading-questions-P2').map(call => call.attempt), [1]);
+  const reading = result.body.paper.reading;
+  assert.deepEqual(Array.from(reading.questions, question => question.number), Array.from({length: 40}, (_, index) => index + 1));
+  assert.deepEqual(Array.from(reading.questions, question => question.passageId), [...Array(13).fill('P1'), ...Array(13).fill('P2'), ...Array(14).fill('P3')]);
+  assert.deepEqual(Array.from(reading.questions.slice(13, 26), questionContent), originals);
+  assert.deepEqual(JSON.parse(JSON.stringify(reading.passages)), makePaper().reading.passages);
+});
+
+test('reading preserves equal-evidence order and never sorts a completion into another format group', async () => {
+  const value = qualityModule();
+  const questions = value.questions;
+  questions[7].evidence = questions[6].evidence;
+  questions[7].answer = questions[6].answer;
+  makeChoice(questions[7]);
+  questions[11].evidence = questions[10].evidence;
+  questions[11].answer = questions[10].answer;
+  questions[9] = fixtureQuestion(10, 0, 'P1');
+  const expected = [...questions.slice(0, 5), questions[5], questions[7], questions[6], questions[8], questions[9], questions[11], questions[10], questions[12]].map(questionContent);
+  value.questions = [...questions.slice(0, 5), ...questions.slice(5, 9).reverse(), ...questions.slice(9).reverse()];
+  value.questions.forEach((question, index) => { question.number = index + 1; });
+  const h = deepseekHarness({deepseekModuleOverrides: {'reading-questions-P1': [{value}]}});
+  const result = await h.invoke({action: 'generate', words: vocab});
+  assert.equal(result.statusCode, 200);
+  assert.equal(h.deepseekModuleCalls.length, 15);
+  const returned = result.body.paper.reading.questions.slice(0, 13);
+  assert.deepEqual(Array.from(returned, questionContent), expected);
+  assert.deepEqual(Array.from(returned, question => question.number), Array.from({length: 13}, (_, index) => index + 1));
+  assert.deepEqual(Array.from(returned, question => question.format), [...Array(5).fill('tfng'), ...Array(4).fill('choice'), ...Array(4).fill('text')]);
+});
+
+test('reading keeps judgment questions and their standard options in input order despite reversed evidence', async () => {
+  const value = qualityModule();
+  value.questions = [...value.questions.slice(0, 5).reverse(), ...value.questions.slice(5)];
+  value.questions.forEach((question, index) => { question.number = index + 1; });
+  const expected = value.questions.slice(0, 5).map(questionContent);
+  const h = deepseekHarness({deepseekModuleOverrides: {'reading-questions-P1': [{value}]}, random: () => 0});
+  const result = await h.invoke({action: 'generate', words: vocab});
+  assert.equal(result.statusCode, 200);
+  assert.equal(h.deepseekModuleCalls.length, 15);
+  const returned = result.body.paper.reading.questions.slice(0, 5);
+  assert.deepEqual(Array.from(returned, questionContent), expected);
+  for (const question of returned) assert.deepEqual(Array.from(question.options), ['TRUE', 'FALSE', 'NOT GIVEN']);
+});
+
+for (const [kind, reading] of [['reading-questions', true], ['listening-questions', false]]) {
+  test(`${kind} shuffles choices while preserving the option set, answer and distractor explanations`, async () => {
+    const value = qualityModule(kind, 2);
+    const originals = value.questions.filter(question => question.format === 'choice').map(question => {
+      question.distractorNotes.forEach((note, index) => { note.reason = `This alternative is excluded by source detail ${index + 1}.`; });
+      return questionContent(question);
+    });
+    const h = deepseekHarness({
+      deepseekModuleOverrides: {[reading ? 'reading-questions-P1' : 'listening-questions-2']: [{value}]},
+      random: () => 0
+    });
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.equal(h.deepseekModuleCalls.length, 15);
+    const questions = reading ? result.body.paper.reading.questions.slice(0, 13) : result.body.paper.listening.parts[1].questions;
+    const returned = Array.from(questions).filter(question => question.format === 'choice');
+    assert.deepEqual(returned.map(questionContent), originals);
+    for (const question of returned) {
+      assert.notEqual(question.options[0], question.answer);
+      assert.equal(question.options.filter(option => option === question.answer).length, 1);
+    }
+  });
+}
 
 test('reading repairs a passage below 700 words before writing its questions', async () => {
   const value = makeDeepSeekModule({kind: 'reading', passageId: 'P1'});

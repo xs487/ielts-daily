@@ -64,6 +64,98 @@ test('numeric marking preserves decimal separators and accepts harmless final pu
   assert.match(h.main.innerHTML,/ai-question answer-wrong" id="listen-q3"/);
 });
 
+async function checkAnswerCases(cases,format='text'){
+  const paper=makePaper();
+  paper.listening.parts.forEach(part=>{part.questions=[];});
+  paper.listening.parts[0].questions=cases.map(([answer,value,expected,alternatives,prompt],index)=>({
+    number:index+1,format,prompt:prompt||`Check answer ${index+1}.`,answer,acceptedAnswers:alternatives||[],
+    ...(format==='choice'?{options:[answer,value,'another option']}:{}),explanation:'Original fixture.'
+  }));
+  paper.answers.listen=Object.fromEntries(cases.map(([,value],index)=>[index+1,value]));
+  const h=harness(paper);h.render();await settle();h.click('submit-listen');
+  assert.equal(h.paper().results.listen.correct,cases.filter(([, ,expected])=>expected).length);
+  cases.forEach(([answer,value,expected],index)=>assert.ok(
+    h.main.innerHTML.includes(`ai-question answer-${expected?'correct':'wrong'}" id="listen-q${index+1}"`),
+    `${JSON.stringify(value)} should ${expected?'match':'not match'} ${JSON.stringify(answer)}`
+  ));
+}
+
+test('text marking accepts explicitly listed British and American spelling equivalents',async()=>{
+  await checkAnswerCases([
+    ['neighbouring','neighboring',true],['neighboring','neighbouring',true],
+    ['colour','color',true],['color','colour',true],['research centre','research center',true],
+    ['theatres','theaters',true],['30 square metres','30 square meters',true],
+    ['behavioural','behavioral',true],['travelling','traveling',true],
+    ['organisation','organization',true],['analysed','analyzed',true],
+    ['unlisted main answer','research center',true,['research centre']]
+  ]);
+});
+
+test('text marking retains meaningful spelling, plurality, articles, hyphens and numeric separators',async()=>{
+  await checkAnswerCases([
+    ['colour','colr',false],['soul','sol',false],['course','corse',false],
+    ['centre','centres',false],['gardens','garden',false],['colour','colors',false],
+    ['a single crop','single crop',false],['the centre','center',false],
+    ['student-led','student led',false],['1.5','15',false],['1,500','15',false],
+    ['1/2','12',false],['room 1.5','room 15',false],['thirty','30',false]
+  ]);
+});
+
+test('text marking accepts unambiguous full-month date order and ordinal variants',async()=>{
+  await checkAnswerCases([
+    ['28 November','28th November',true],['28 November','November 28th',true],
+    ['November 28','28th of November',true],['twenty-eighth of November','28th November',true],
+    ['twenty eighth November','November 28th',true],['1 January','January 1st',true],
+    ['22 March','March 22nd',true],['23 April','April 23rd',true],['11 May','May 11th',true],
+    ['28 November 2026','November 28th, 2026',true],['November 28, 2026','28th of November 2026',true],
+    ['29 February 2024','February 29th, 2024',true],['29 February','February 29th',true]
+  ]);
+});
+
+test('date matching preserves years and rejects ambiguous, invalid or expanded dates',async()=>{
+  await checkAnswerCases([
+    ['28 November 2026','November 28th 2027',false],['28 November 2026','November 28th',false],
+    ['28 November','November 28th 2026',false],['28 November','29 November',false],
+    ['28 November','28 December',false],['1 February','01/02',false],['2 January','01/02',false],
+    ['01/02','02/01',false],['28 November','the 28th of November',false],
+    ['28 November','by November 28th',false],['28 November','28st November',false],
+    ['11 May','May 11st',false],['31 November','November 31st',false],
+    ['29 February 2025','February 29th 2025',false],['1.5 November','15 November',false],
+    ['28 November','date:11:28:',false]
+  ]);
+});
+
+test('choice labels keep exact text matching without spelling or date equivalence',async()=>{
+  await checkAnswerCases([
+    ['colour','color',false],['28 November','November 28th',false],
+    ['research centre',' RESEARCH CENTRE. ',true]
+  ],'choice');
+});
+
+test('text marking enforces stated word and number limits before equivalent date matching',async()=>{
+  await checkAnswerCases([
+    ['28 November','November 28th',true,[], 'Write NO MORE THAN ONE WORD AND/OR A NUMBER.'],
+    ['28 November','28th of November',false,[], 'Write NO MORE THAN ONE WORD AND/OR A NUMBER.'],
+    ['28 November','twenty-eighth of November',false,[], 'Write NO MORE THAN TWO WORDS.'],
+    ['28 November','28th of November',true,[], 'Write NO MORE THAN TWO WORDS AND/OR A NUMBER.'],
+    ['28 November','twenty-eighth of November',true,[], 'Write NO MORE THAN THREE WORDS.'],
+    ['28 November 2026','November 28th, 2026',false,[], 'Write NO MORE THAN THREE WORDS AND/OR A NUMBER.'],
+    ['28 November 2026','28 November 2026',false,[], 'Write NO MORE THAN THREE WORDS AND A NUMBER.'],
+    ['28 November 2026','November 28th, 2026',true,[], 'Write NO MORE THAN THREE WORDS.'],
+    ['28 November 2026','November 28th, 2026',true,[], 'Give the date.'],
+    ['student-led','student-led',true,[], 'Write ONE WORD ONLY.'],
+    ['research centre','research center',true,[], 'Write 2 WORDS ONLY.'],
+    ['research centre','research center',false,[], 'Write ONE WORD ONLY.'],
+    ['a single crop','a single crop',false,[], 'Write TWO WORDS ONLY.'],
+    ['28','28',true,[], 'Write ONE WORD OR A NUMBER.'],
+    ['28 November','November 28th',false,[], 'Write ONE WORD OR A NUMBER.'],
+    ['1.5 metres','1.5 meters',true,[], 'Write ONE WORD AND/OR A NUMBER.'],
+    ['$28 per person','$28 per person',false,[], 'Write TWO WORDS AND/OR A NUMBER.'],
+    ['28 dollars per person','28 dollars per person',false,[], 'Write TWO WORDS AND/OR A NUMBER.'],
+    ['the research centre','the research center',true,[], 'Give the location.']
+  ]);
+});
+
 test('old papers with malformed accepted variants remain usable and blanks are never correct',async()=>{
   const paper=makePaper();
   paper.listening.parts[0].questions=[

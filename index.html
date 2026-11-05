@@ -428,6 +428,53 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   const setError=text=>{errorText=text||'';};
   // Ignore sentence-ending punctuation without changing decimals or other meaningful separators.
   const normalize=value=>String(value??'').trim().normalize('NFKC').toLowerCase().replace(/\s+/g,' ').replace(/[.,!?。！？]+$/g,'').trim();
+  // Only listed spelling equivalents are interchangeable; retain articles and inflections.
+  const spellingEquivalents=new Map([
+    ['neighbour','neighbor'],['neighbours','neighbors'],['neighbouring','neighboring'],['neighbourhood','neighborhood'],['neighbourhoods','neighborhoods'],
+    ['colour','color'],['colours','colors'],['coloured','colored'],['colouring','coloring'],['colourful','colorful'],
+    ['centre','center'],['centres','centers'],['theatre','theater'],['theatres','theaters'],
+    ['metre','meter'],['metres','meters'],['litre','liter'],['litres','liters'],
+    ['favourite','favorite'],['favourites','favorites'],['flavour','flavor'],['flavours','flavors'],
+    ['behaviour','behavior'],['behaviours','behaviors'],['behavioural','behavioral'],
+    ['organisation','organization'],['organisations','organizations'],['organise','organize'],['organised','organized'],['organising','organizing'],
+    ['analyse','analyze'],['analysed','analyzed'],['analysing','analyzing'],
+    ['traveller','traveler'],['travellers','travelers'],['travelled','traveled'],['travelling','traveling']
+  ]);
+  const monthNames=['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const ordinalDays=['first','second','third','fourth','fifth','sixth','seventh','eighth','ninth','tenth','eleventh','twelfth','thirteenth','fourteenth','fifteenth','sixteenth','seventeenth','eighteenth','nineteenth','twentieth',...['first','second','third','fourth','fifth','sixth','seventh','eighth','ninth'].map(day=>`twenty-${day}`),'thirtieth','thirty-first'];
+  const dayBeforeMonth=new RegExp(`^(.+?)(?: of)? (${monthNames.join('|')})(?:,? (\\d{4}))?$`);
+  const monthBeforeDay=new RegExp(`^(${monthNames.join('|')}) (.+?)(?:,? (\\d{4}))?$`);
+  function namedDate(value){
+    const first=dayBeforeMonth.exec(value),second=first?null:monthBeforeDay.exec(value);
+    if(!first&&!second)return null;
+    const dayText=first?first[1]:second[2],month=monthNames.indexOf(first?first[2]:second[1]),year=(first||second)[3]||'';
+    const numeric=/^(\d{1,2})(st|nd|rd|th)?$/.exec(dayText);
+    const day=numeric?Number(numeric[1]):ordinalDays.indexOf(dayText.replace(/ /g,'-'))+1;
+    if(numeric?.[2]){
+      const suffix=day%100>=11&&day%100<=13?'th':({1:'st',2:'nd',3:'rd'}[day%10]||'th');
+      if(numeric[2]!==suffix)return null;
+    }
+    const leap=!year||(Number(year)%4===0&&(Number(year)%100!==0||Number(year)%400===0));
+    const maxDay=[31,leap?29:28,31,30,31,30,31,31,30,31,30,31][month];
+    if(day<1||day>maxDay||(year&&Number(year)<1))return null;
+    return `date:${month+1}:${day}:${year}`;
+  }
+  const normalizeTextAnswer=value=>{
+    const normalized=normalize(value);
+    return namedDate(normalized)||`text:${normalized.replace(/\b[a-z]+\b/g,word=>spellingEquivalents.get(word)||word)}`;
+  };
+  function fitsAnswerLimit(prompt,value){
+    const limit=/\b(?:no more than\s+)?(one|two|three|[1-3])\s+words?(?:\s+only)?(?:\s+(and\/or|and|or)\s+(?:a|one|1)\s+number)?\b/i.exec(String(prompt||''));
+    if(!limit)return true;
+    const maxWords={one:1,two:2,three:3}[limit[1].toLowerCase()]||Number(limit[1]);
+    const tokens=normalize(value).split(/\s+/).filter(Boolean),clause=limit[2]?.toLowerCase();
+    if(!clause)return tokens.length<=maxWords;
+    // Keep currency signs and units as written tokens. A written date's day and
+    // year are two numbers, even when date equivalence would otherwise match.
+    const numbers=tokens.filter(token=>/^[+-]?\d+(?:[.,:]\d+)*(?:st|nd|rd|th)?[,]?$/.test(token)).length;
+    const words=tokens.length-numbers;
+    return clause==='or'?(numbers===0&&words<=maxWords)||(numbers===1&&words===0):numbers<=1&&words<=maxWords;
+  }
   const countWords=text=>(String(text||'').trim().match(/[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*/g)||[]).length;
   const questionControl=(question,value,locked)=>{
     const id=`answer-${question.number}`;
@@ -436,7 +483,7 @@ dialog{border-radius:10px;background:var(--surface);border-color:var(--line);col
   };
   const correct=(question,value)=>{
     if(!normalize(value))return false;
-    if(question.format==='text')return [question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])].some(answer=>typeof answer==='string'&&normalize(answer)===normalize(value));
+    if(question.format==='text')return fitsAnswerLimit(question.prompt,value)&&[question.answer,...(Array.isArray(question.acceptedAnswers)?question.acceptedAnswers:[])].some(answer=>typeof answer==='string'&&normalizeTextAnswer(answer)===normalizeTextAnswer(value));
     return normalize(question.answer)===normalize(value);
   };
   const skillGuidance={
