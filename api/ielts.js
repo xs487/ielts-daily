@@ -760,8 +760,8 @@ module.exports = async function handler(req, res) {
         let retried=false;
         if(generated?.handled){
           const code=generated.failure?.body?.code;
-          if(!['AI_INVALID_RESPONSE','AI_INCOMPLETE_RESPONSE'].includes(code))return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
-          generated=await run([`response_format:${code}`],true);
+          if(!['AI_INVALID_RESPONSE','AI_INCOMPLETE_RESPONSE','AI_CONNECTION_FAILED'].includes(code))return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
+          generated=await run([`${code==='AI_CONNECTION_FAILED'?'connection':'response_format'}:${code}`],true);
           retried=true;
           if(generated?.handled)return {failure:generated.failure||{status:502,body:{error:'AI 服务暂未完成请求，请稍后重试。',code:'AI_UPSTREAM_ERROR'}}};
         }

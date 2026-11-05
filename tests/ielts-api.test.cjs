@@ -356,7 +356,6 @@ function createHarness({redisMode = 'ok', aiStatus = 200, aiStatusSequence = [],
         return response(200, event(chunk1) + '\n' + event(chunk2) + event(complete), 'application/x-ndjson', doubaoMode === 'chunked' ? 7 : 8192);
       }
       if (url === 'https://api.deepseek.com/chat/completions') {
-        if (deepseekMode === 'network-error') throw new Error(`transport failure includes ${fakeDeepSeekKey}`);
         if (aiGate) await aiGate.enter();
         const currentStatus = aiStatusSequence[aiRequestCount] ?? aiStatus;
         const currentPaper = paperSequence[aiRequestCount];
@@ -365,8 +364,12 @@ function createHarness({redisMode = 'ok', aiStatus = 200, aiStatusSequence = [],
         const isGrading = request.messages[0].content.includes('Evaluate the supplied IELTS');
         const userContent = request.messages.find(message => message.role === 'user')?.content || '';
         const {module, payload: modulePayload, key: moduleKey, override} = moduleContext(userContent);
+        if (deepseekMode === 'network-error' || override?.networkError) throw new Error(`transport failure includes ${fakeDeepSeekKey}`);
         const status = override?.status ?? currentStatus;
-        if (status !== 200) return response(status, {error: {message: `failure includes ${fakeDeepSeekKey} and ${fakeOpenAIKey}`}});
+        if (status !== 200) return response(status, {error: {
+          message: `failure includes ${fakeDeepSeekKey} and ${fakeOpenAIKey}`,
+          ...(override?.errorCode ? {code: override.errorCode} : {})
+        }});
         const content = deepseekMode === 'reasoning-only' ? '' : deepseekMode === 'invalid-json' ? '{broken-json'
           : isGrading ? JSON.stringify(gradeFeedback)
             : override && Object.prototype.hasOwnProperty.call(override, 'content') ? override.content
@@ -1311,6 +1314,61 @@ test('one module HTTP failure releases quota, and a later request retries all mo
   assert.equal(h.deepseekModuleCalls.length, 30);
   assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'release', 'reserve', 'commit']);
 });
+
+for (const key of ['listening-script-2', 'reading-questions-P3']) {
+  test(`${key} retries one connection failure without regenerating other modules`, async () => {
+    const h = deepseekHarness({deepseekModuleOverrides: {[key]: [{networkError: true}]}});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 200);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === key).map(call => call.attempt), [1, 2]);
+    assert.equal(h.deepseekModuleCalls.length, 16);
+    assert.equal(h.deepseekModuleCalls.filter(call => call.key !== key).length, 14);
+    assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'commit']);
+    const attempts = h.calls.filter(call => call.url === 'https://api.deepseek.com/chat/completions')
+      .map(call => JSON.parse(call.options.body))
+      .filter(body => {
+        const module = JSON.parse(body.messages.find(message => message.role === 'user').content).module;
+        return key === 'listening-script-2' ? module.kind === 'listening-script' && module.part === 2
+          : module.kind === 'reading-questions' && module.passageId === 'P3';
+      });
+    assert.equal(attempts.length, 2);
+    assert.match(attempts[1].messages[0].content, /connection:AI_CONNECTION_FAILED/);
+    const firstPayload = JSON.parse(attempts[0].messages.find(message => message.role === 'user').content);
+    const retryPayload = JSON.parse(attempts[1].messages.find(message => message.role === 'user').content);
+    assert.deepEqual(retryPayload, firstPayload);
+    assert.doesNotMatch(JSON.stringify(result.body), /transport failure|sk-deepseek-test-never-a-real-secret/);
+  });
+
+  test(`${key} releases quota after two connection failures`, async () => {
+    const h = deepseekHarness({deepseekModuleOverrides: {[key]: [{networkError: true}, {networkError: true}]}});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, 502);
+    assert.equal(result.body.code, 'AI_CONNECTION_FAILED');
+    assert.equal(result.body.paper, undefined);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === key).map(call => call.attempt), [1, 2]);
+    assert.equal(h.deepseekModuleCalls.length, key === 'listening-script-2' ? 9 : 16);
+    assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'release']);
+    assert.equal(h.reservationState.has(h.reservationCalls[0].pendingKey), false);
+    assert.equal(h.reservationState.has(h.reservationCalls[0].usedKey), false);
+    assert.doesNotMatch(JSON.stringify(result.body), /transport failure|sk-deepseek-test-never-a-real-secret/);
+  });
+}
+
+for (const [status, errorCode, resultCode, resultStatus] of [
+  [401, undefined, 'AI_AUTH_FAILED', 502],
+  [429, 'insufficient_quota', 'AI_QUOTA_UNAVAILABLE', 429]
+]) {
+  test(`a module ${resultCode} does not retry and releases quota`, async () => {
+    const h = deepseekHarness({deepseekModuleOverrides: {'reading-questions-P3': [{status, errorCode}]}});
+    const result = await h.invoke({action: 'generate', words: vocab});
+    assert.equal(result.statusCode, resultStatus);
+    assert.equal(result.body.code, resultCode);
+    assert.equal(result.body.paper, undefined);
+    assert.deepEqual(h.deepseekModuleCalls.filter(call => call.key === 'reading-questions-P3').map(call => call.attempt), [1]);
+    assert.equal(h.deepseekModuleCalls.length, 15);
+    assert.deepEqual(h.reservationCalls.map(call => call.operation), ['reserve', 'release']);
+  });
+}
 
 test('AI_INVALID_RESPONSE for one module is retried once and the complete exam can commit', async () => {
   const h = deepseekHarness({deepseekModuleOverrides: {'reading-questions-P1': [{content: 'not a paper'}]}});
